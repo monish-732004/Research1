@@ -1,4 +1,4 @@
-.PHONY: setup preprocess analyze simulate figures test lint clean
+.PHONY: setup validate preprocess preprocess-force analyze simulate figures test lint clean
 
 PYTHON := python
 SRC    := src
@@ -14,10 +14,10 @@ validate:
 	$(PYTHON) -m $(SRC).ingest.validate --trace v2023
 
 preprocess:
-	$(PYTHON) -m $(SRC).preprocess.clock_align
-	$(PYTHON) -m $(SRC).preprocess.state_machine
-	$(PYTHON) -m $(SRC).preprocess.truncation
-	$(PYTHON) -m $(SRC).preprocess.aggregate
+	$(PYTHON) -m $(SRC).preprocess.pipeline --trace v2026
+
+preprocess-force:
+	$(PYTHON) -m $(SRC).preprocess.pipeline --trace v2026 --force
 
 analyze:
 	$(PYTHON) -m $(SRC).analysis.fragmentation

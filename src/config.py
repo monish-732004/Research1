@@ -26,6 +26,23 @@ TRACE_NAME      = "cluster-trace-gpu-v2026"
 TRACE_N_GPUS    = 155_000
 TRACE_DURATION_DAYS = 180       # ~6 months
 
+# ── Trace temporal structure (hourly-aggregated ASI schema) ───────────────────
+TRACE_DAYS          = 185                           # actual days in the trace
+TRACE_HOURS_PER_DAY = 24
+TRACE_START_HOUR    = 0
+TRACE_END_HOUR      = TRACE_DAYS * TRACE_HOURS_PER_DAY - 1   # 4439
+
+NETWORK_DAYS        = 7
+NETWORK_END_HOUR    = NETWORK_DAYS * TRACE_HOURS_PER_DAY - 1  # 167
+
+# ── Pod state space ───────────────────────────────────────────────────────────
+POD_STATES   = ["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "EVICTED", "UNKNOWN"]
+ACTIVE_STATES = frozenset({"PENDING", "RUNNING"})
+
+# ── Server tier GPU thresholds ────────────────────────────────────────────────
+SERVER_TIER_SMALL_MAX  = 4   # ≤ 4 GPUs → "small"
+SERVER_TIER_MEDIUM_MAX = 8   # 5–8 GPUs → "medium"  (> 8 → "large")
+
 # ── Alibaba cluster regions present in the trace ─────────────────────────────
 ALIBABA_REGIONS = [
     "cn-hangzhou",
