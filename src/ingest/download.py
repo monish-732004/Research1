@@ -153,11 +153,29 @@ def _extract_zip(zip_path: Path, dest_dir: Path) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(trace: str, out_dir: Path, dry_run: bool = False) -> None:
+def run(
+    trace: str,
+    out_dir: Path,
+    dry_run: bool = False,
+    only: str | None = None,
+) -> None:
     yaml_path, manifest = _load_manifest(trace)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     archives = manifest.get("archives") or manifest.get("files") or []
+
+    if only:
+        # Match by name prefix or exact stem (without .zip)
+        archives = [
+            e for e in archives
+            if e["name"] == only
+            or e["name"] == f"{only}.zip"
+            or Path(e["name"]).stem == only
+        ]
+        if not archives:
+            print(f"No archive matching '{only}' found in manifest.")
+            sys.exit(1)
+
     print(f"Trace: {trace}  ({len(archives)} archive(s))\n")
 
     for entry in archives:
@@ -227,9 +245,15 @@ def main(argv: list[str] | None = None) -> None:
         "--dry-run", action="store_true",
         help="Print what would be downloaded without downloading.",
     )
+    parser.add_argument(
+        "--only",
+        default=None,
+        metavar="NAME",
+        help="Download only the archive whose name matches (with or without .zip).",
+    )
     args = parser.parse_args(argv)
     out_dir = args.out or (RAW_DIR / args.trace)
-    run(args.trace, out_dir, dry_run=args.dry_run)
+    run(args.trace, out_dir, dry_run=args.dry_run, only=args.only)
 
 
 if __name__ == "__main__":
