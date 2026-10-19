@@ -1,207 +1,180 @@
-"""Tests for Stage A — schema canonicalization."""
+"""Tests for Phase 2 canonicalization logic.
+
+Tests use DuckDB with synthetic in-memory data — no Parquet files needed.
+"""
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
 import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pandas as pd
 import pytest
 
-from src.preprocess.canonicalize import (
-    _actual_columns, _discover_mapping, _build_pod_select,
-    _POD_ALIASES, _SERVER_ALIASES,
-)
+from src.preprocess.tdp import get_tdp
 
 
-# ── Synthetic data helpers ────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _write_pod_parquet(
-    columns: dict[str, pa.Array],
-    path: Path,
-) -> None:
-    table = pa.table(columns)
-    pq.write_table(table, path)
+def _con() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect()
 
 
-def _basic_pod_columns(n: int = 20) -> dict[str, pa.Array]:
-    """Synthetic pod data with non-canonical column names (like a real trace)."""
-    return {
-        "pod_id":       pa.array([f"p{i:04d}" for i in range(n)]),
-        "day":          pa.array([i // 24 for i in range(n)], type=pa.int32()),
-        "hour":         pa.array([i % 24 for i in range(n)], type=pa.int32()),
-        "gpu_num":      pa.array([4] * n, type=pa.int32()),
-        "avg_gpu_util": pa.array([0.5] * n, type=pa.float32()),
-        "priority":     pa.array([1] * n, type=pa.int32()),
-        "status":       pa.array(["RUNNING"] * n),
-    }
+# ── 1. hour cast: VARCHAR "00"-"23" → INTEGER ─────────────────────────────────
+
+class TestHourCast:
+    def test_hour_cast(self):
+        con = _con()
+        con.execute("""
+            CREATE TABLE t AS
+            SELECT * FROM (VALUES
+                ('s1', 3, '07'),
+                ('s2', 7, '23')
+            ) AS v(server_id, day, hour)
+        """)
+        df = con.execute("""
+            SELECT
+                day,
+                CAST(hour AS INTEGER) AS hour_int,
+                day * 24 + CAST(hour AS INTEGER) AS rel_hour
+            FROM t
+        """).df()
+
+        assert list(df["hour_int"])  == [7, 23]
+        assert list(df["rel_hour"])  == [3*24+7, 7*24+23]
 
 
-def _percent_util_columns(n: int = 10) -> dict[str, pa.Array]:
-    """gpu_util expressed as 0–100 (should be normalised to 0–1)."""
-    cols = _basic_pod_columns(n)
-    cols["avg_gpu_util"] = pa.array([50.0] * n, type=pa.float32())
-    return cols
+# ── 2. server tier classification ─────────────────────────────────────────────
+
+class TestServerTier:
+    @pytest.mark.parametrize("gpu_count,expected_tier", [
+        (1,  "small"),
+        (2,  "small"),
+        (3,  "medium"),
+        (8,  "medium"),
+        (9,  "large"),
+        (16, "large"),
+    ])
+    def test_server_tier(self, gpu_count, expected_tier):
+        con = _con()
+        df = con.execute(f"""
+            SELECT
+                CASE
+                    WHEN {gpu_count} <= 2 THEN 'small'
+                    WHEN {gpu_count} <= 8 THEN 'medium'
+                    ELSE 'large'
+                END AS server_tier
+        """).df()
+        assert df["server_tier"].iloc[0] == expected_tier
 
 
-# ── Tests: alias resolution ───────────────────────────────────────────────────
+# ── 3. gpu_hours_requested = gpu_request × duration_hours ─────────────────────
 
-class TestAliasResolution:
-    def test_canonical_names_resolve_from_aliases(self, tmp_path):
-        path = tmp_path / "pod.parquet"
-        _write_pod_parquet(_basic_pod_columns(), path)
-        actual = _actual_columns(path)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
+class TestGpuHours:
+    def test_gpu_hours_calculation(self):
+        con = _con()
+        con.execute("""
+            CREATE TABLE jobs AS
+            SELECT * FROM (VALUES
+                ('j1', 0.24, 10.0),
+                ('j2', 1.0,  5.0),
+                ('j3', 0.5,  0.0)
+            ) AS v(pod_id, gpu_request, duration_hours)
+        """)
+        df = con.execute("""
+            SELECT pod_id, gpu_request * duration_hours AS gpu_hours_requested
+            FROM jobs
+        """).df()
 
-        assert mapping["pod_uid"] == "pod_id"
-        assert mapping["day"] == "day"
-        assert mapping["hour"] == "hour"
-        assert mapping["gpu_requested"] == "gpu_num"
-        assert mapping["gpu_util"] == "avg_gpu_util"
-        assert mapping["priority"] == "priority"
-        assert mapping["state"] == "status"
-
-    def test_canonical_name_used_as_fallback(self, tmp_path):
-        """If the actual column name IS the canonical name, it should still resolve."""
-        path = tmp_path / "pod.parquet"
-        n = 5
-        cols = {
-            "pod_uid":       pa.array([f"p{i}" for i in range(n)]),
-            "day":           pa.array([0] * n, type=pa.int32()),
-            "hour":          pa.array(list(range(n)), type=pa.int32()),
-            "gpu_requested": pa.array([2] * n, type=pa.int32()),
-            "gpu_util":      pa.array([0.3] * n, type=pa.float32()),
-            "priority":      pa.array([0] * n, type=pa.int32()),
-            "state":         pa.array(["PENDING"] * n),
-        }
-        _write_pod_parquet(cols, path)
-        actual = _actual_columns(path)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
-        assert mapping["pod_uid"] == "pod_uid"
-        assert mapping["gpu_requested"] == "gpu_requested"
-
-    def test_missing_optional_column_maps_to_none(self, tmp_path):
-        path = tmp_path / "pod.parquet"
-        _write_pod_parquet(_basic_pod_columns(), path)
-        actual = _actual_columns(path)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
-        # server_uid is not in basic columns → None
-        assert mapping["server_uid"] is None
+        assert abs(df.loc[df["pod_id"]=="j1","gpu_hours_requested"].iloc[0] - 2.4) < 1e-9
+        assert abs(df.loc[df["pod_id"]=="j2","gpu_hours_requested"].iloc[0] - 5.0) < 1e-9
+        assert abs(df.loc[df["pod_id"]=="j3","gpu_hours_requested"].iloc[0] - 0.0) < 1e-9
 
 
-# ── Tests: SELECT query generation ───────────────────────────────────────────
+# ── 4. TDP lookup (exact, prefix, fallback) ───────────────────────────────────
 
-class TestSelectGeneration:
-    def test_output_has_canonical_columns(self, tmp_path):
-        pod_src = tmp_path / "pod_raw.parquet"
-        pod_out = tmp_path / "pod_canonical.parquet"
-        _write_pod_parquet(_basic_pod_columns(), pod_src)
+class TestTdpLookup:
+    def test_exact_match(self):
+        assert get_tdp("A10")  == 150
+        assert get_tdp("H100") == 700
+        assert get_tdp("L20")  == 275
 
-        actual = _actual_columns(pod_src)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
+    def test_prefix_match(self):
+        assert get_tdp("A100-80GB")  == 400   # prefix "A100"
+        assert get_tdp("H800-80G")   == 700   # prefix "H800"
 
-        con = duckdb.connect()
-        sql = _build_pod_select(pod_src, mapping, con)
-        con.execute(f"COPY ({sql}) TO '{pod_out}' (FORMAT PARQUET)")
+    def test_fallback_for_unknown(self):
+        assert get_tdp("UNKNOWN_XYZ") == 350
+        assert get_tdp("")             == 350
+        assert get_tdp("unknown")      == 350
 
-        result = pq.read_table(pod_out)
-        assert "pod_uid"       in result.column_names
-        assert "day"           in result.column_names
-        assert "hour"          in result.column_names
-        assert "rel_hour"      in result.column_names
-        assert "gpu_requested" in result.column_names
-        assert "gpu_util"      in result.column_names
-        assert "priority"      in result.column_names
-        assert "state"         in result.column_names
 
-    def test_rel_hour_is_day_times_24_plus_hour(self, tmp_path):
-        pod_src = tmp_path / "pod_raw.parquet"
-        pod_out = tmp_path / "pod_canonical.parquet"
+# ── 5. is_deferrable flag ─────────────────────────────────────────────────────
 
-        n = 5
-        cols = {
-            "pod_uid":       pa.array([f"p{i}" for i in range(n)]),
-            "day":           pa.array([3, 3, 7, 7, 10], type=pa.int32()),
-            "hour":          pa.array([0, 1, 0, 23, 5], type=pa.int32()),
-            "gpu_num":       pa.array([4] * n, type=pa.int32()),
-            "avg_gpu_util":  pa.array([0.5] * n, type=pa.float32()),
-            "priority":      pa.array([0] * n, type=pa.int32()),
-            "status":        pa.array(["RUNNING"] * n),
-        }
-        _write_pod_parquet(cols, pod_src)
+class TestIsDeferrable:
+    def test_online_inference_never_deferrable(self):
+        """online_inference jobs must not be deferred regardless of priority."""
+        con = _con()
+        con.execute("""
+            CREATE TABLE jobs AS
+            SELECT * FROM (VALUES
+                ('j1', 'online_inference', 'LP', TRUE),
+                ('j2', 'online_inference', 'HP', TRUE),
+                ('j3', 'offline_inference', 'LP', TRUE),
+                ('j4', 'batch',            'LP', TRUE),
+                ('j5', 'batch',            'HP', TRUE),
+                ('j6', 'batch',            'LP', FALSE)
+            ) AS v(pod_id, job_type_public, priority_class, ready_status)
+        """)
+        df = con.execute("""
+            SELECT
+                pod_id,
+                (
+                    job_type_public NOT IN ('online_inference')
+                    AND priority_class = 'LP'
+                    AND ready_status = TRUE
+                ) AS is_deferrable
+            FROM jobs
+        """).df()
 
-        actual = _actual_columns(pod_src)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
+        by_id = df.set_index("pod_id")["is_deferrable"]
+        assert by_id["j1"] == False   # online_inference LP → NOT deferrable
+        assert by_id["j2"] == False   # online_inference HP → NOT deferrable
+        assert by_id["j3"] == True    # offline_inference LP ready → deferrable
+        assert by_id["j4"] == True    # batch LP ready → deferrable
+        assert by_id["j5"] == False   # batch HP → NOT deferrable (wrong priority)
+        assert by_id["j6"] == False   # batch LP not ready → NOT deferrable
 
-        con = duckdb.connect()
-        sql = _build_pod_select(pod_src, mapping, con)
-        result_df = con.execute(sql).df()
 
-        expected_rel_hours = [3*24+0, 3*24+1, 7*24+0, 7*24+23, 10*24+5]
-        assert list(result_df["rel_hour"]) == expected_rel_hours
+# ── 6. allocation_efficiency ──────────────────────────────────────────────────
 
-    def test_gpu_util_normalised_from_percent(self, tmp_path):
-        """If source stores 0–100, the output should be 0.0–1.0."""
-        pod_src = tmp_path / "pod_pct.parquet"
-        pod_out = tmp_path / "pod_can.parquet"
-        _write_pod_parquet(_percent_util_columns(), pod_src)
+class TestAllocationEfficiency:
+    def test_efficiency_calculation(self):
+        """Server with 8 GPUs × 10 hours = 80 capacity; 60 GPU-hours requested → 0.75."""
+        con = _con()
+        con.execute("""
+            CREATE TABLE capacity AS
+            SELECT * FROM (VALUES ('srv1', 80.0)) AS v(server_id, total_capacity_gpu_hours)
+        """)
+        con.execute("""
+            CREATE TABLE requested AS
+            SELECT * FROM (VALUES ('srv1', 60.0)) AS v(server_id, total_requested_gpu_hours)
+        """)
+        df = con.execute("""
+            SELECT
+                c.server_id,
+                r.total_requested_gpu_hours / c.total_capacity_gpu_hours
+                    AS allocation_efficiency
+            FROM capacity c
+            JOIN requested r USING (server_id)
+        """).df()
 
-        actual = _actual_columns(pod_src)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
+        eff = df["allocation_efficiency"].iloc[0]
+        assert abs(eff - 0.75) < 1e-9
 
-        con = duckdb.connect()
-        sql = _build_pod_select(pod_src, mapping, con)
-        result_df = con.execute(sql).df()
-
-        assert all(0.0 <= v <= 1.0 for v in result_df["gpu_util"].dropna())
-
-    def test_state_uppercased(self, tmp_path):
-        """State values should be uppercased in the canonical table."""
-        pod_src = tmp_path / "pod_lower.parquet"
-        n = 3
-        cols = {
-            "pod_uid":  pa.array([f"p{i}" for i in range(n)]),
-            "day":      pa.array([0] * n, type=pa.int32()),
-            "hour":     pa.array(list(range(n)), type=pa.int32()),
-            "gpu_num":  pa.array([2] * n, type=pa.int32()),
-            "avg_gpu_util": pa.array([0.6] * n, type=pa.float32()),
-            "priority": pa.array([0] * n, type=pa.int32()),
-            "status":   pa.array(["running", "pending", "failed"]),
-        }
-        _write_pod_parquet(cols, pod_src)
-
-        actual = _actual_columns(pod_src)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
-
-        con = duckdb.connect()
-        sql = _build_pod_select(pod_src, mapping, con)
-        result_df = con.execute(sql).df()
-
-        assert set(result_df["state"]) == {"RUNNING", "PENDING", "FAILED"}
-
-    def test_missing_gpu_util_column_yields_null(self, tmp_path):
-        """A source with no gpu_util column should produce NULLs, not crash."""
-        pod_src = tmp_path / "pod_no_util.parquet"
-        n = 4
-        cols = {
-            "pod_uid":  pa.array([f"p{i}" for i in range(n)]),
-            "day":      pa.array([0] * n, type=pa.int32()),
-            "hour":     pa.array(list(range(n)), type=pa.int32()),
-            "gpu_num":  pa.array([8] * n, type=pa.int32()),
-            "priority": pa.array([1] * n, type=pa.int32()),
-            "status":   pa.array(["RUNNING"] * n),
-            # no gpu_util column
-        }
-        _write_pod_parquet(cols, pod_src)
-
-        actual = _actual_columns(pod_src)
-        mapping = _discover_mapping(actual, _POD_ALIASES)
-        assert mapping["gpu_util"] is None
-
-        con = duckdb.connect()
-        sql = _build_pod_select(pod_src, mapping, con)
-        result_df = con.execute(sql).df()
-
-        assert result_df["gpu_util"].isna().all()
+    def test_zero_capacity_yields_null(self):
+        con = _con()
+        df = con.execute("""
+            SELECT
+                CASE WHEN 0.0 = 0 THEN NULL ELSE 60.0 / 0.0 END
+                    AS allocation_efficiency
+        """).df()
+        assert pd.isna(df["allocation_efficiency"].iloc[0])

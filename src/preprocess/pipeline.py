@@ -18,12 +18,12 @@ import time
 from typing import Any, Callable
 
 from src.config import LOG_DIR
-from src.preprocess import canonicalize, completeness, truncation, aggregate
+from src.preprocess import canonicalize, tdp, aggregate
 
+# Stages: A → B → C  (truncation flags are embedded in canonicalize Stage A)
 STAGE_ORDER: list[tuple[str, Callable]] = [
     ("canonicalize", canonicalize.run),
-    ("completeness", completeness.run),
-    ("truncation",   truncation.run),
+    ("tdp",          tdp.run),
     ("aggregate",    aggregate.run),
 ]
 

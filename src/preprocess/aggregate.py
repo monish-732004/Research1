@@ -1,21 +1,9 @@
-"""Stage D — Hourly fragmentation aggregation.
+"""Stage C — Fleet capacity + job summary + allocation efficiency.
 
-Computes per-(rel_hour, server_tier) GPU fragmentation metrics:
-
-  gpu_used_est      = gpu_requested × gpu_util
-  frag_gpu_hours    = gpu_requested − gpu_used_est
-
-Server tier is derived from the server's total GPU count (if a
-pod→server mapping exists in pod_hourly_canonical.server_uid):
-  small  : gpu_count_total ≤ SERVER_TIER_SMALL_MAX   (default ≤ 4)
-  medium : gpu_count_total ≤ SERVER_TIER_MEDIUM_MAX  (default ≤ 8)
-  large  : gpu_count_total >  SERVER_TIER_MEDIUM_MAX
-
-Output
-------
-  data/processed/hourly_frag.parquet
-    rel_hour, server_tier,
-    total_gpus_requested, total_gpus_used, total_frag_gpu_hours, pod_count
+Outputs (data/processed/):
+  hourly_fleet_capacity.parquet      — per-hour total GPUs available + server counts
+  job_type_summary.parquet           — job counts + GPU-hours by type/priority/spec
+  server_allocation_efficiency.parquet — requested vs capacity per server
 
 Usage
 -----
@@ -33,104 +21,168 @@ import duckdb
 from src.config import (
     INTERIM_DIR, PROCESSED_DIR,
     DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS,
-    SERVER_TIER_SMALL_MAX, SERVER_TIER_MEDIUM_MAX,
 )
 
 
-def run(trace: str, *, force: bool = False) -> dict[str, Any]:
-    INTERIM_DIR.mkdir(parents=True, exist_ok=True)
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    out = PROCESSED_DIR / "hourly_frag.parquet"
-
-    if out.exists() and not force:
-        rows = duckdb.execute(
-            f"SELECT count(*) FROM read_parquet('{out}')"
-        ).fetchone()[0]
-        print(f"  [aggregate] output exists ({rows:,} rows) — skipping")
-        return {"rows_out": rows, "skipped": True}
-
-    pod_src    = INTERIM_DIR / "pod_hourly_canonical.parquet"
-    server_src = INTERIM_DIR / "server_hourly_canonical.parquet"
-
-    if not pod_src.exists():
-        raise FileNotFoundError(f"{pod_src} not found. Run canonicalize first.")
-
+def _con() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}'")
     con.execute(f"SET threads={DUCKDB_THREADS}")
+    return con
 
-    # Detect whether pod table carries a server_uid mapping
-    pod_cols = {
-        r[0] for r in con.execute(
-            f"DESCRIBE SELECT * FROM read_parquet('{pod_src}')"
-        ).fetchall()
-    }
-    has_server_col  = "server_uid" in pod_cols
-    has_server_file = server_src.exists()
-    use_server_join = has_server_col and has_server_file
 
-    if use_server_join:
-        server_join = f"""
-        LEFT JOIN read_parquet('{server_src}') s
-          ON p.server_uid = s.server_uid
-         AND p.day = s.day
-         AND p.hour = s.hour
-        """
-        tier_expr = f"""
-        CASE
-            WHEN s.gpu_count_total IS NULL          THEN 'unknown'
-            WHEN s.gpu_count_total <= {SERVER_TIER_SMALL_MAX}  THEN 'small'
-            WHEN s.gpu_count_total <= {SERVER_TIER_MEDIUM_MAX} THEN 'medium'
-            ELSE 'large'
-        END
-        """
-    else:
-        server_join = ""
-        tier_expr   = "'unknown'"
+def _s(p) -> str:
+    return str(p).replace("\\", "/")
 
-    sql = f"""
-    WITH pod_frag AS (
-        SELECT
-            p.rel_hour,
-            p.gpu_requested,
-            COALESCE(p.gpu_requested * p.gpu_util, 0.0)           AS gpu_used_est,
-            COALESCE(p.gpu_requested * (1.0 - p.gpu_util), p.gpu_requested::FLOAT) AS frag_gpu_hours,
-            {tier_expr} AS server_tier
-        FROM read_parquet('{pod_src}') p
-        {server_join}
-        WHERE p.state = 'RUNNING'
-          AND p.gpu_requested IS NOT NULL
-          AND p.gpu_requested > 0
-    )
-    SELECT
-        rel_hour,
-        server_tier,
-        sum(gpu_requested)     AS total_gpus_requested,
-        sum(gpu_used_est)      AS total_gpus_used,
-        sum(frag_gpu_hours)    AS total_frag_gpu_hours,
-        count(*)               AS pod_count
-    FROM pod_frag
-    GROUP BY rel_hour, server_tier
-    ORDER BY rel_hour, server_tier
-    """
 
-    con.execute(f"COPY ({sql}) TO '{out}' (FORMAT PARQUET)")
-    n_rows = con.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+# ── C1: per-hour fleet capacity ───────────────────────────────────────────────
 
-    total_frag = con.execute(
-        f"SELECT sum(total_frag_gpu_hours) FROM read_parquet('{out}')"
-    ).fetchone()[0] or 0.0
+def aggregate_fleet_capacity(con: duckdb.DuckDBPyConnection, *, force: bool = False) -> dict:
+    out = PROCESSED_DIR / "hourly_fleet_capacity.parquet"
+    if out.exists() and not force:
+        return {"skipped": True, "output": str(out)}
 
-    join_note = "with server join" if use_server_join else "pod-level only (no server mapping)"
-    print(
-        f"  [aggregate] {n_rows:,} (rel_hour × tier) rows  "
-        f"| total frag: {total_frag:,.0f} GPU-hours  [{join_note}]"
-    )
-    return {"rows_out": n_rows, "skipped": False}
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    src = _s(INTERIM_DIR / "server_hourly_canonical.parquet")
+    out_s = _s(out)
+
+    print("  [fleet_capacity] aggregating …")
+    con.execute(f"""
+        COPY (
+            SELECT
+                day,
+                hour_int,
+                rel_hour,
+                SUM(gpu_count)              AS total_gpus_available,
+                COUNT(DISTINCT server_id)   AS active_servers,
+                COUNT(DISTINCT cluster_id)  AS active_clusters
+            FROM read_parquet('{src}')
+            GROUP BY day, hour_int, rel_hour
+            ORDER BY rel_hour
+        ) TO '{out_s}' (FORMAT PARQUET)
+    """)
+
+    rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{out_s}')").fetchone()[0]
+    print(f"  [fleet_capacity] {rows:,} hours → {out}")
+    return {"output": str(out), "rows": rows}
+
+
+# ── C2: job-level GPU-hours by type/priority/spec ────────────────────────────
+
+def aggregate_job_type_summary(con: duckdb.DuckDBPyConnection, *, force: bool = False) -> dict:
+    out = PROCESSED_DIR / "job_type_summary.parquet"
+    if out.exists() and not force:
+        return {"skipped": True, "output": str(out)}
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    src = _s(INTERIM_DIR / "job_summary_canonical.parquet")
+    out_s = _s(out)
+
+    print("  [job_type_summary] aggregating …")
+    con.execute(f"""
+        COPY (
+            SELECT
+                job_type_public,
+                priority_class,
+                gpu_spec_public,
+                is_genai_request,
+                is_deferrable,
+                COUNT(*)                                                AS job_count,
+                SUM(gpu_hours_requested)                               AS total_gpu_hours_requested,
+                AVG(gpu_request)                                       AS mean_gpu_request,
+                PERCENTILE_CONT(0.5) WITHIN GROUP
+                    (ORDER BY gpu_request)                             AS p50_gpu_request,
+                PERCENTILE_CONT(0.95) WITHIN GROUP
+                    (ORDER BY gpu_request)                             AS p95_gpu_request,
+                AVG(duration_hours)                                    AS mean_duration_hours,
+                AVG(schedule_delay_sec)                                AS mean_schedule_delay_sec,
+                SUM(CASE WHEN ready_status    THEN 1 ELSE 0 END)      AS ready_count,
+                SUM(CASE WHEN schedule_status THEN 1 ELSE 0 END)      AS scheduled_count
+            FROM read_parquet('{src}')
+            GROUP BY
+                job_type_public, priority_class, gpu_spec_public,
+                is_genai_request, is_deferrable
+        ) TO '{out_s}' (FORMAT PARQUET)
+    """)
+
+    rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{out_s}')").fetchone()[0]
+    print(f"  [job_type_summary] {rows:,} groups → {out}")
+    return {"output": str(out), "rows": rows}
+
+
+# ── C3: server allocation efficiency ─────────────────────────────────────────
+
+def aggregate_server_efficiency(con: duckdb.DuckDBPyConnection, *, force: bool = False) -> dict:
+    out = PROCESSED_DIR / "server_allocation_efficiency.parquet"
+    if out.exists() and not force:
+        return {"skipped": True, "output": str(out)}
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    srv = _s(INTERIM_DIR / "server_hourly_canonical.parquet")
+    job = _s(INTERIM_DIR / "job_summary_canonical.parquet")
+    out_s = _s(out)
+
+    print("  [server_efficiency] joining server capacity + job requests …")
+    con.execute(f"""
+        COPY (
+            WITH capacity AS (
+                SELECT
+                    server_id,
+                    ANY_VALUE(gpu_spec_public)          AS gpu_spec_public,
+                    ANY_VALUE(server_tier)              AS server_tier,
+                    -- each row = 1 GPU-hour per gpu on that server that hour
+                    SUM(gpu_count * 1.0)                AS total_capacity_gpu_hours
+                FROM read_parquet('{srv}')
+                GROUP BY server_id
+            ),
+            requested AS (
+                SELECT
+                    server_id,
+                    SUM(gpu_hours_requested)            AS total_requested_gpu_hours,
+                    COUNT(*)                            AS job_count
+                FROM read_parquet('{job}')
+                WHERE server_id IS NOT NULL
+                GROUP BY server_id
+            )
+            SELECT
+                c.server_id,
+                c.gpu_spec_public,
+                c.server_tier,
+                c.total_capacity_gpu_hours,
+                COALESCE(r.total_requested_gpu_hours, 0.0) AS total_requested_gpu_hours,
+                COALESCE(r.job_count, 0)                    AS job_count,
+                CASE
+                    WHEN c.total_capacity_gpu_hours = 0 THEN NULL
+                    ELSE COALESCE(r.total_requested_gpu_hours, 0.0)
+                         / c.total_capacity_gpu_hours
+                END                                         AS allocation_efficiency
+            FROM capacity c
+            LEFT JOIN requested r USING (server_id)
+        ) TO '{out_s}' (FORMAT PARQUET)
+    """)
+
+    rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{out_s}')").fetchone()[0]
+    print(f"  [server_efficiency] {rows:,} servers → {out}")
+    return {"output": str(out), "rows": rows}
+
+
+# ── Orchestrator ──────────────────────────────────────────────────────────────
+
+def run(trace: str, *, force: bool = False) -> dict[str, Any]:
+    print(f"  [aggregate] trace={trace}")
+    con = _con()
+    results: dict[str, Any] = {}
+
+    results["fleet_capacity"]    = aggregate_fleet_capacity(con, force=force)
+    results["job_type_summary"]  = aggregate_job_type_summary(con, force=force)
+    results["server_efficiency"] = aggregate_server_efficiency(con, force=force)
+
+    skipped = all(r.get("skipped") for r in results.values())
+    return {"skipped": skipped, "outputs": results}
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Compute hourly GPU fragmentation.")
+    parser = argparse.ArgumentParser(description="Aggregate fleet capacity and job summaries.")
     parser.add_argument("--trace", choices=["v2026", "v2023"], required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
