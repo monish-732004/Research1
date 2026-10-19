@@ -64,6 +64,23 @@ GRID_INTENSITY_DEFAULTS: dict[str, float] = {
     "cn-shenzhen":  490.0,   # Guangdong province (higher hydro mix)
 }
 
+# ── Raw data glob helper ──────────────────────────────────────────────────────
+
+def table_glob(table_name: str, trace: str = "v2026") -> str:
+    """Return a glob pattern for all Parquet files for *table_name*.
+
+    Handles both extraction layouts:
+      single-level: data/raw/<trace>/<table>/**/*.parquet
+      double-level: data/raw/<trace>/<table>/<table>/**/*.parquet  (ZIP quirk)
+    """
+    import glob as _glob
+    double = RAW_DIR / trace / table_name / table_name / "**" / "*.parquet"
+    single = RAW_DIR / trace / table_name / "**" / "*.parquet"
+    if _glob.glob(str(double), recursive=True):
+        return str(double)
+    return str(single)
+
+
 # ── DuckDB settings ───────────────────────────────────────────────────────────
 DUCKDB_MEMORY_LIMIT = "12GB"    # leave headroom on a 16 GB laptop
 DUCKDB_THREADS      = 4

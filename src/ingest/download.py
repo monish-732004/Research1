@@ -137,6 +137,22 @@ def _download_file(url: str, dest: Path, expected_size: int | None) -> None:
 
 # ── Extract ───────────────────────────────────────────────────────────────────
 
+def _flatten_if_double_nested(dest_dir: Path, archive_stem: str) -> None:
+    """If dest_dir/archive_stem/ exists, move its contents up and remove it."""
+    inner = dest_dir / archive_stem
+    if not inner.is_dir():
+        return
+    import shutil
+    print(f"  Flattening double-nested extraction for {archive_stem} …")
+    for item in list(inner.iterdir()):
+        target = dest_dir / item.name
+        if target.exists():
+            shutil.rmtree(target) if target.is_dir() else target.unlink()
+        shutil.move(str(item), str(dest_dir))
+    inner.rmdir()
+    print(f"  Flattened: {dest_dir}")
+
+
 def _extract_zip(zip_path: Path, dest_dir: Path) -> None:
     """Extract *zip_path* into *dest_dir*, skipping already-extracted files."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +165,7 @@ def _extract_zip(zip_path: Path, dest_dir: Path) -> None:
                 continue  # already extracted
             zf.extract(member, dest_dir)
     print(f"  Extracted {len(members)} file(s).")
+    _flatten_if_double_nested(dest_dir, zip_path.stem)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
