@@ -1,0 +1,55 @@
+# Data — never commit raw/interim/processed data
+data/raw/
+data/interim/
+data/processed/
+*.parquet
+*.csv.gz
+
+# Outputs
+outputs/figures/
+outputs/tables/
+outputs/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# DuckDB
+*.duckdb
+*.wal
+
+# LaTeX
+paper/*.aux
+paper/*.log
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.out
+paper/_minted*/

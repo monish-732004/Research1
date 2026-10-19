@@ -1,0 +1,64 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\graphicspath{{figures/}}
+
+% ── Metadata ──────────────────────────────────────────────────────────────────
+\title{Quantifying GPU Resource Fragmentation and Its Carbon Cost at Hyperscale:
+       A Study of the Alibaba Cluster Trace}
+
+\author{%
+  \IEEEauthorblockN{Author Name}
+  \IEEEauthorblockA{%
+    \textit{Affiliation}\\
+    City, Country \\
+    email@example.com}
+}
+
+\begin{document}
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────────────────────
+\begin{abstract}
+GPU clusters suffer from \emph{resource fragmentation}: idle GPU-hours caused
+by scheduling gaps, job preemptions, and heterogeneous workload shapes.
+We analyse 155\,000 GPUs over six months using the Alibaba
+cluster-trace-gpu-v2026 and quantify the resulting carbon waste by joining
+the trace with real-time grid carbon intensity data.
+We find that [X]\% of allocated GPU-time is wasted, corresponding to
+[Y]\,tCO$_2$eq over the measurement period.
+We further propose and evaluate CADS, a Carbon-Aware Deferral Scheduler that
+reduces emissions by [Z]\% with less than [W]\% increase in job completion
+time, requiring no hardware changes.
+\end{abstract}
+
+\begin{IEEEkeywords}
+GPU scheduling, carbon-aware computing, resource fragmentation, green data
+centres, cluster traces
+\end{IEEEkeywords}
+
+% ── Body ──────────────────────────────────────────────────────────────────────
+\input{sections/01_introduction}
+\input{sections/02_background}
+\input{sections/03_methodology}
+\input{sections/04_fragmentation}
+\input{sections/05_carbon_analysis}
+\input{sections/06_cads}
+\input{sections/07_evaluation}
+\input{sections/08_related_work}
+\input{sections/09_conclusion}
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
