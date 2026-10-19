@@ -1,0 +1,32 @@
+# Manifest for Alibaba cluster-trace-gpu-v2026
+# URLs from: https://github.com/alibaba/clusterdata/tree/master/cluster-trace-gpu-v2026
+# md5 is null = computed and cached on first successful download.
+
+trace: v2026
+description: "Alibaba cluster-trace-gpu-v2026 (~155K GPUs, 6 months)"
+base_url: "https://tre-clusterdata.oss-cn-hangzhou.aliyuncs.com/cluster-trace-gpu-v2026/data/"
+
+archives:
+  - name: asi_opensource_pod_hourly.zip
+    url: "https://tre-clusterdata.oss-cn-hangzhou.aliyuncs.com/cluster-trace-gpu-v2026/data/asi_opensource_pod_hourly.zip"
+    size_bytes: 351803513445
+    unpacks_to: "data/raw/v2026/asi_opensource_pod_hourly/"
+    md5: null
+
+  - name: asi_opensource_server_hourly.zip
+    url: "https://tre-clusterdata.oss-cn-hangzhou.aliyuncs.com/cluster-trace-gpu-v2026/data/asi_opensource_server_hourly.zip"
+    size_bytes: 3080121387
+    unpacks_to: "data/raw/v2026/asi_opensource_server_hourly/"
+    md5: null
+
+  - name: asi_opensource_network_hourly.zip
+    url: "https://tre-clusterdata.oss-cn-hangzhou.aliyuncs.com/cluster-trace-gpu-v2026/data/asi_opensource_network_hourly.zip"
+    size_bytes: 203904100
+    unpacks_to: "data/raw/v2026/asi_opensource_network_hourly/"
+    md5: null
+
+  - name: asi_opensource_job_execution_summary.zip
+    url: "https://tre-clusterdata.oss-cn-hangzhou.aliyuncs.com/cluster-trace-gpu-v2026/data/asi_opensource_job_execution_summary.zip"
+    size_bytes: 1188295031
+    unpacks_to: "data/raw/v2026/asi_opensource_job_execution_summary/"
+    md5: null
