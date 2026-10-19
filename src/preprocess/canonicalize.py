@@ -53,6 +53,9 @@ _POD_ALIASES: dict[str, list[str]] = {
     # optional: pod → server mapping (may be absent)
     "server_uid":    ["server_uid", "machine_id", "node_id", "worker_id",
                       "machine_uid", "server_id"],
+    # optional: workload category (training / inference / ad-hoc / offline-inference)
+    "workload_type": ["workload_type", "job_type", "model_type", "task_type",
+                      "workload", "category", "work_type", "app_type"],
 }
 
 _SERVER_ALIASES: dict[str, list[str]] = {
@@ -79,6 +82,7 @@ _POD_CASTS: dict[str, str] = {
     "priority":      "INTEGER",
     "state":         "VARCHAR",
     "server_uid":    "VARCHAR",
+    "workload_type": "VARCHAR",
 }
 
 _SERVER_CASTS: dict[str, str] = {
@@ -185,6 +189,26 @@ def _build_pod_select(
         parts.append(f"CAST(\"{src}\" AS VARCHAR) AS server_uid")
     else:
         parts.append("NULL::VARCHAR AS server_uid")
+
+    # workload_type (optional) — normalise to lowercase known values
+    src = mapping.get("workload_type")
+    if src:
+        parts.append(
+            f"CASE lower(CAST(\"{src}\" AS VARCHAR))\n"
+            f"        WHEN 'training'           THEN 'training'\n"
+            f"        WHEN 'train'              THEN 'training'\n"
+            f"        WHEN 'inference'          THEN 'inference'\n"
+            f"        WHEN 'infer'              THEN 'inference'\n"
+            f"        WHEN 'offline_inference'  THEN 'offline_inference'\n"
+            f"        WHEN 'offline-inference'  THEN 'offline_inference'\n"
+            f"        WHEN 'ad_hoc'             THEN 'ad_hoc'\n"
+            f"        WHEN 'ad-hoc'             THEN 'ad_hoc'\n"
+            f"        WHEN 'dev'                THEN 'ad_hoc'\n"
+            f"        ELSE lower(CAST(\"{src}\" AS VARCHAR))\n"
+            f"    END AS workload_type"
+        )
+    else:
+        parts.append("NULL::VARCHAR AS workload_type")
 
     cols = ",\n    ".join(parts)
     return f"SELECT\n    {cols}\nFROM read_parquet('{parquet_path}')"

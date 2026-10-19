@@ -21,6 +21,7 @@ preprocess-force:
 
 analyze:
 	$(PYTHON) -m $(SRC).analysis.fragmentation
+	$(PYTHON) -m $(SRC).analysis.wasted_hours
 	$(PYTHON) -m $(SRC).analysis.carbon_join
 	$(PYTHON) -m $(SRC).analysis.correlation
 
