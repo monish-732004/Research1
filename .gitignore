@@ -1,5 +1,9 @@
 # Data — never commit raw/interim/processed data
-data/raw/
+# Manifests WITH urls/md5s are secrets; templates are safe to commit
+data/raw/v2026/
+data/raw/v2023/
+data/raw/manifests/v2026.yaml
+data/raw/manifests/v2023.yaml
 data/interim/
 data/processed/
 *.parquet

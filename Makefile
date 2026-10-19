@@ -9,6 +9,10 @@ setup:
 	@echo "Setup complete. Activate your venv first if you haven't already."
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
+validate:
+	$(PYTHON) -m $(SRC).ingest.validate --trace v2026
+	$(PYTHON) -m $(SRC).ingest.validate --trace v2023
+
 preprocess:
 	$(PYTHON) -m $(SRC).preprocess.clock_align
 	$(PYTHON) -m $(SRC).preprocess.state_machine

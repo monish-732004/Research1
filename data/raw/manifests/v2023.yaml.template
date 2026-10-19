@@ -1,0 +1,38 @@
+# Manifest for Alibaba cluster-trace-gpu-v2023
+# Validation / comparison dataset (~6,200 GPUs, same schema as v2026).
+# Fill in `url` and `md5` after receiving survey-approval links.
+# Then rename this file to v2023.yaml.
+
+trace: v2023
+description: "Alibaba cluster-trace-gpu-v2023 (~6,200 GPUs, validation set)"
+
+files:
+  - table: instance_events
+    filename: instance_events.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: machine_events
+    filename: machine_events.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: resource_usage
+    filename: resource_usage.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: resource_request
+    filename: resource_request.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: task_metadata
+    filename: task_metadata.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0

@@ -1,0 +1,37 @@
+# Manifest for Alibaba cluster-trace-gpu-v2026
+# Fill in `url` and `md5` for each file after receiving survey-approval links.
+# Then rename this file to v2026.yaml.
+
+trace: v2026
+description: "Alibaba cluster-trace-gpu-v2026 (~155K GPUs, 6 months)"
+
+files:
+  - table: instance_events
+    filename: instance_events.parquet
+    url: ""       # paste URL here
+    md5: ""       # paste MD5 hex here
+    size_bytes: 0 # paste expected size here
+
+  - table: machine_events
+    filename: machine_events.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: resource_usage
+    filename: resource_usage.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: resource_request
+    filename: resource_request.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
+
+  - table: task_metadata
+    filename: task_metadata.parquet
+    url: ""
+    md5: ""
+    size_bytes: 0
