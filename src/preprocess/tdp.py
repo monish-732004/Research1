@@ -38,6 +38,17 @@ GPU_TDP: dict[str, int] = {
     "A40":     300,
     "RTX3090": 350,
     "RTX4090": 450,
+    "H20":     500,   # Nvidia H20 (China-market H100 variant, public spec: 500W TDP)
+    "H20-141GB": 500, # same die, same TDP
+    # Alibaba proprietary XPU accelerators — no public TDP available.
+    # Estimates based on comparable datacenter accelerator class.
+    # Paper must disclose this assumption and run sensitivity analysis
+    # (±30%) in Section 5.
+    "XPU-A":   250,
+    "XPU-B":   250,
+    "XPU-C":   300,
+    "XPU-D":   300,
+    "XPU-E":   350,   # likely higher-end given naming convention
     "unknown": 350,   # conservative fleet-average fallback
 }
 
