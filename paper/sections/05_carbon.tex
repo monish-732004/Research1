@@ -1,0 +1,36 @@
+\section{Carbon Cost of GPU Fragmentation}
+\label{sec:carbon}
+
+% TODO: Replace synthetic carbon profiles with real Electricity Maps historical data.
+% Current numbers are illustrative only.
+% See docs/api_applications.md for the submitted academic access request.
+
+\subsection{Carbon Intensity Model}
+\label{sec:carbon:model}
+
+% TODO: Describe synthetic diurnal model; replace with real data when API key arrives.
+% Cite: IEA China Electricity 2023, CEA Annual Report 2023--2024.
+
+\subsection{Idle GPU Carbon Cost}
+\label{sec:carbon:idle}
+
+% TODO: Fill in numbers from outputs/tables/phase4_headline.json once real data arrives.
+% Placeholder structure:
+%   "Under the \texttt{cn-north} grid profile (800\,gCO_2eq/kWh annual average),
+%    the 333\,M unallocated GPU-hours correspond to approximately X\,ktCO_2eq
+%    over the 185-day trace period."
+
+\subsection{Deferrable Job Carbon Savings}
+\label{sec:carbon:deferrable}
+
+% TODO: Quantify upper-bound savings from shifting deferrable (LP batch) jobs
+%       to low-carbon 12-hour windows.
+% Use outputs/tables/table3_deferrable_savings.csv
+
+\subsection{Sensitivity Analysis}
+\label{sec:carbon:sensitivity}
+
+% TODO: Three calendar anchors (2025-01-01, 2025-04-01, 2025-07-01) ×
+%       four grid profiles — headline numbers vary < X\% across anchors
+%       but X\% across regions.
+% TODO: XPU TDP ±30\% sensitivity from \S\ref{sec:methodology}.

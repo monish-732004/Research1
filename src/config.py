@@ -64,6 +64,25 @@ GRID_INTENSITY_DEFAULTS: dict[str, float] = {
     "cn-shenzhen":  490.0,   # Guangdong province (higher hydro mix)
 }
 
+# Synthetic grid profiles for sensitivity analysis (Phase 4).
+# Each entry: annual_avg (gCO₂/kWh), peak_hour (0–23 local), peak_factor (×).
+# Diurnal multiplier: 1 + (peak_factor-1)*sin((h-6)*π/18) for h∈[6,24], 0.85 for h<6.
+GRID_PROFILES: dict[str, dict] = {
+    "cn-north":     {"annual_avg": 800, "peak_hour": 19, "peak_factor": 1.15},
+    "cn-east":      {"annual_avg": 650, "peak_hour": 20, "peak_factor": 1.12},
+    "cn-south":     {"annual_avg": 550, "peak_hour": 19, "peak_factor": 1.10},
+    "cn-northwest": {"annual_avg": 750, "peak_hour": 18, "peak_factor": 1.20},
+}
+
+# Calendar anchors for sensitivity: maps label → ISO date string
+CALENDAR_ANCHORS: dict[str, str] = {
+    "2025-01-01": "2025-01-01",
+    "2025-04-01": "2025-04-01",
+    "2025-07-01": "2025-07-01",
+}
+
+CARBON_RAW_DIR = RAW_DIR / "carbon"
+
 # ── Raw data glob helper ──────────────────────────────────────────────────────
 
 def table_glob(table_name: str, trace: str = "v2026") -> str:
