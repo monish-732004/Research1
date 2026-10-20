@@ -69,7 +69,7 @@ def canonicalize_server_hourly(trace: str, con: duckdb.DuckDBPyConnection, *, fo
                     WHEN gpu_count <= 8 THEN 'medium'
                     ELSE 'large'
                 END                                        AS server_tier
-            FROM read_parquet('{glob}')
+            FROM read_parquet('{glob}', union_by_name=true)
         ) TO '{out_s}' (FORMAT PARQUET, ROW_GROUP_SIZE 200000)
     """)
 
@@ -121,7 +121,7 @@ def canonicalize_job_summary(trace: str, con: duckdb.DuckDBPyConnection, *, forc
                 -- truncation flags (Task D)
                 (schedule_delay_sec = 0 AND ready_delay_sec = 0) AS left_truncated,
                 (duration_hours > 4000)                     AS right_truncated
-            FROM read_parquet('{glob}')
+            FROM read_parquet('{glob}', union_by_name=true)
         ) TO '{out_s}' (FORMAT PARQUET, ROW_GROUP_SIZE 200000)
     """)
 
@@ -152,7 +152,7 @@ def canonicalize_network_hourly(trace: str, con: duckdb.DuckDBPyConnection, *, f
                 CAST(hour AS INTEGER)              AS hour_int,
                 day * 24 + CAST(hour AS INTEGER)   AS rel_hour,
                 TRUE                               AS in_network_window
-            FROM read_parquet('{glob}')
+            FROM read_parquet('{glob}', union_by_name=true)
         ) TO '{out_s}' (FORMAT PARQUET, ROW_GROUP_SIZE 200000)
     """)
 
