@@ -1,9 +1,11 @@
-"""Evaluation metrics and feature importance for all five algorithms.
+"""Evaluation metrics and feature importance for all six algorithms.
 
 Computes on TEST split only (train/val are for fitting; test is held out).
 
 Metrics per algorithm: MAE, RMSE, MAPE, R², Pinball@0.9,
                        training time, prediction latency.
+CAPSR-only metric: Deferral Precision@K (fraction of top-K confidence jobs
+                   that are actually above-mean gpu_hours for their stratum).
 Also produces per-job-type MAE/RMSE and feature importance (tree models).
 
 Outputs
@@ -65,7 +67,6 @@ def pinball(y_true: np.ndarray, y_pred: np.ndarray, tau: float = 0.9) -> float:
 
 def latency_ms_per_10k(model, X: np.ndarray, n_runs: int = 5) -> float:
     """Median wall-clock time to predict 10,000 rows, in milliseconds."""
-    # Use first 10,000 rows (or all if fewer)
     Xs = X[:10_000]
     times = []
     for _ in range(n_runs):
@@ -73,6 +74,27 @@ def latency_ms_per_10k(model, X: np.ndarray, n_runs: int = 5) -> float:
         model.predict(Xs)
         times.append(time.perf_counter() - t0)
     return float(np.median(times) * 1000)
+
+
+def deferral_precision_at_k(
+    model,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    k_pct: float = 0.10,
+) -> float | None:
+    """Deferral Precision@K for CAPSR: fraction of top-K confidence jobs that
+    are actually above the global mean gpu_hours.
+
+    Returns None for models without predict_deferral_confidence().
+    """
+    if not hasattr(model, "predict_deferral_confidence"):
+        return None
+    confidence = model.predict_deferral_confidence(X_test).astype(np.float64)
+    k          = max(1, int(len(y_test) * k_pct))
+    top_k_idx  = np.argsort(confidence)[-k:]
+    global_mean = float(y_test.mean())
+    precision   = float((y_test[top_k_idx] > global_mean).mean())
+    return round(precision, 4)
 
 
 # ── Load data ─────────────────────────────────────────────────────────────────
@@ -108,6 +130,7 @@ def _per_jobtype_metrics(
     merged = feats.merge(splits[["pod_id", "split", "job_type_public"]], on="pod_id",
                          how="left")
     test_jt = merged[merged["split"] == "test"]["job_type_public"].values
+    test_jt = test_jt[:len(X_test)]  # align with fast-mode truncation
 
     pred = model.predict(X_test)
     rows = []
@@ -181,15 +204,17 @@ def run_evaluation(
         print(f"  [eval] {model.name} …")
         pred = model.predict(X_test)
 
+        dp_at_k = deferral_precision_at_k(model, X_test, y_test, k_pct=0.10)
         row = {
-            "algorithm":        model.name,
-            "mae":              round(mae(y_test, pred), 4),
-            "rmse":             round(rmse(y_test, pred), 4),
-            "mape":             round(mape(y_test, pred), 2),
-            "r2":               round(r2(y_test, pred), 4),
-            "pinball_90":       round(pinball(y_test, pred), 4),
-            "train_time_s":     round(train_times.get(model.name, float("nan")), 1),
-            "latency_ms_10k":   round(latency_ms_per_10k(model, X_test), 2),
+            "algorithm":                  model.name,
+            "mae":                        round(mae(y_test, pred), 4),
+            "rmse":                       round(rmse(y_test, pred), 4),
+            "mape":                       round(mape(y_test, pred), 2),
+            "r2":                         round(r2(y_test, pred), 4),
+            "pinball_90":                 round(pinball(y_test, pred), 4),
+            "train_time_s":               round(train_times.get(model.name, float("nan")), 1),
+            "latency_ms_10k":             round(latency_ms_per_10k(model, X_test), 2),
+            "deferral_precision_at_10pct": dp_at_k,
         }
         cmp_rows.append(row)
 
