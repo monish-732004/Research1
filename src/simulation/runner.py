@@ -3,6 +3,7 @@
 Usage:
     python -m src.simulation.runner --mode baseline
     python -m src.simulation.runner --mode cads
+    python -m src.simulation.runner --mode cads --predictive
 """
 
 import argparse
@@ -16,7 +17,7 @@ from src.simulation.baseline import BaselineScheduler
 from src.simulation.cads import CADSScheduler
 
 
-def run(mode: str = "baseline") -> dict:
+def run(mode: str = "baseline", predictive: bool = False) -> dict:
     con = duckdb.connect()
     con.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}'")
     con.execute(f"SET threads={DUCKDB_THREADS}")
@@ -27,7 +28,11 @@ def run(mode: str = "baseline") -> dict:
         sched: BaselineScheduler | CADSScheduler = BaselineScheduler(env, TRACE_N_GPUS)
     elif mode == "cads":
         # TODO: load intensity forecast from processed/carbon_intensity.parquet
-        sched = CADSScheduler(env, TRACE_N_GPUS, intensity_forecast={})
+        sched = CADSScheduler(
+            env, TRACE_N_GPUS,
+            intensity_forecast={},
+            predictive_mode=predictive,
+        )
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -38,5 +43,7 @@ def run(mode: str = "baseline") -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["baseline", "cads"], default="baseline")
+    parser.add_argument("--predictive", action="store_true",
+                        help="Enable predictive mode in CADS (Phase 4.5)")
     args = parser.parse_args()
-    run(args.mode)
+    run(args.mode, predictive=args.predictive)

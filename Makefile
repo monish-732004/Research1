@@ -29,6 +29,27 @@ simulate:
 	$(PYTHON) -m $(SRC).simulation.runner --mode baseline
 	$(PYTHON) -m $(SRC).simulation.runner --mode cads
 
+# ── Modeling (Phase 4.5) ──────────────────────────────────────────────────────
+# Full run (~90 min).  Use FAST=1 for a 10% subsample (~5 min).
+FAST_FLAG := $(if $(FAST),--fast,)
+
+model: _model_features _model_split _model_train _model_evaluate _model_choose
+
+_model_features:
+	$(PYTHON) -m $(SRC).modeling.features $(FAST_FLAG)
+
+_model_split:
+	$(PYTHON) -m $(SRC).modeling.split
+
+_model_train:
+	$(PYTHON) -m $(SRC).modeling.train $(FAST_FLAG)
+
+_model_evaluate:
+	$(PYTHON) -m $(SRC).modeling.evaluate $(FAST_FLAG)
+
+_model_choose:
+	$(PYTHON) -m $(SRC).modeling.choose
+
 figures:
 	$(PYTHON) -m $(SRC).viz.figures
 
