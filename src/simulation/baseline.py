@@ -63,6 +63,7 @@ def _load_jobs() -> pd.DataFrame:
     df = pd.read_parquet(_JOB_SRC, columns=cols)
     df["left_truncated"]  = df["left_truncated"].fillna(False).astype(bool)
     df["right_truncated"] = df["right_truncated"].fillna(False).astype(bool)
+    df["is_deferrable"]   = df["is_deferrable"].fillna(False).astype(bool)
     df = df[~df["left_truncated"] & ~df["right_truncated"]].copy()
     df["tdp_w"]   = df["gpu_spec_public"].map(
         lambda s: get_tdp(s) if isinstance(s, str) else DEFAULT_TDP_W
