@@ -1,35 +1,35 @@
 """GPU wasted-hour and energy calculations (RQ1 — magnitude).
 
+Computes allocation-based waste (GPU capacity never assigned to any job)
+from server_allocation_efficiency.parquet and job_type_summary.parquet.
+
+NOTE: This is a lower bound on true waste. Utilization-based waste
+(GPUs allocated but underutilised within jobs) requires pod_hourly data.
+
 Functions
 ---------
-total_wasted_gpu_hours      headline waste figure
-wasted_kwh                  convert GPU-hours to kWh given TDP
-wasted_co2eq                kWh × grid intensity → gCO₂eq
-breakdown_by_priority       waste split by priority class
-breakdown_by_workload       waste split by workload type
+total_unallocated_gpu_hours    fleet-level headline waste figure
+wasted_kwh                     GPU-hours → kWh (configurable TDP + overhead)
+wasted_co2eq                   kWh × grid intensity → gCO₂eq
+waste_report                   WasteReport for all TDP scenarios
+breakdown_by_priority          waste split by priority class
+breakdown_by_workload          waste split by workload type
 
 GPU TDP scenarios
 -----------------
-A100_TDP  = 400 W  (SXM4 TDP)
-H100_TDP  = 700 W  (SXM5 TDP)
-MIXED_TDP = 550 W  (assumed 50/50 fleet)
-
-Usage
------
-    python -m src.analysis.wasted_hours
+  A100 = 400 W,  H100 = 700 W,  mixed = weighted-average from fleet spec mix
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
 
 import duckdb
 import pandas as pd
 
 from src.config import (
-    INTERIM_DIR, PROCESSED_DIR, TABLE_DIR,
+    PROCESSED_DIR, TABLE_DIR,
     DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS,
     GRID_INTENSITY_DEFAULTS,
 )
@@ -38,7 +38,7 @@ from src.config import (
 
 A100_TDP_W  = 400.0
 H100_TDP_W  = 700.0
-MIXED_TDP_W = 550.0   # fleet-weighted default
+MIXED_TDP_W = 550.0   # fleet-weighted default (A100/H100 mix)
 
 TDP_SCENARIOS: dict[str, float] = {
     "A100":  A100_TDP_W,
@@ -46,8 +46,7 @@ TDP_SCENARIOS: dict[str, float] = {
     "mixed": MIXED_TDP_W,
 }
 
-# Overhead multiplier: PUE × memory power fraction
-# Typical hyperscale PUE ≈ 1.15; GPU memory draws ≈ 10% extra
+# PUE × GPU memory overhead (typical hyperscale PUE ≈ 1.15, memory ≈ 10%)
 POWER_OVERHEAD = 1.15 * 1.10
 
 
@@ -60,108 +59,95 @@ def _con() -> duckdb.DuckDBPyConnection:
     return c
 
 
-_FRAG_SRC = PROCESSED_DIR / "hourly_frag.parquet"
-_POD_SRC  = INTERIM_DIR   / "pod_hourly_canonical.parquet"
+def _s(p: Path) -> str:
+    return str(p).replace("\\", "/")
+
+
+_EFF_SRC = PROCESSED_DIR / "server_allocation_efficiency.parquet"
+_JTS_SRC = PROCESSED_DIR / "job_type_summary.parquet"
+
+
+# ── Dataclass ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class WasteReport:
+    tdp_scenario: str
+    tdp_watts: float
+    unallocated_gpu_hours: float
+    wasted_kwh: float
+    wasted_co2eq_g: float
+    region: str
+
+    def __str__(self) -> str:
+        return (
+            f"[{self.tdp_scenario:5s} {self.tdp_watts:.0f}W] "
+            f"{self.unallocated_gpu_hours:>14,.0f} GPU-h  "
+            f"{self.wasted_kwh:>12,.1f} kWh  "
+            f"{self.wasted_co2eq_g/1e6:>10,.2f} tCO₂eq  "
+            f"({self.region})"
+        )
 
 
 # ── Core calculations ─────────────────────────────────────────────────────────
 
-def total_wasted_gpu_hours(
+def total_unallocated_gpu_hours(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    eff_src: Path = _EFF_SRC,
 ) -> float:
-    """Return total fragmented GPU-hours over the full trace."""
+    """Total GPU-hours of fleet capacity never allocated to any job."""
     c = con or _con()
-    row = c.execute(
-        f"SELECT sum(total_frag_gpu_hours) FROM read_parquet('{frag_src}')"
-    ).fetchone()
+    row = c.execute(f"""
+        SELECT sum(total_capacity_gpu_hours - total_requested_gpu_hours)
+        FROM read_parquet('{_s(eff_src)}')
+        WHERE total_capacity_gpu_hours > 0
+    """).fetchone()
     return float(row[0] or 0.0)
 
 
 def wasted_kwh(
-    gpu_hours: float,
-    *,
+    unallocated_gpu_hours: float,
     tdp_watts: float = MIXED_TDP_W,
-    include_overhead: bool = True,
+    overhead: float = POWER_OVERHEAD,
 ) -> float:
-    """Convert fragmented GPU-hours to wasted kWh.
+    """Convert unallocated GPU-hours to kWh.
 
-    Parameters
-    ----------
-    gpu_hours:
-        Total wasted GPU-hours.
-    tdp_watts:
-        GPU thermal design power in watts.
-    include_overhead:
-        If True, multiply by POWER_OVERHEAD (PUE + memory).
+    kWh = gpu_hours × TDP_W × overhead / 1000
     """
-    multiplier = POWER_OVERHEAD if include_overhead else 1.0
-    return gpu_hours * (tdp_watts / 1000.0) * multiplier
+    return unallocated_gpu_hours * tdp_watts * overhead / 1000.0
 
 
 def wasted_co2eq(
     kwh: float,
     region: str = "cn-beijing",
-    *,
     intensity_g_per_kwh: float | None = None,
 ) -> float:
     """Convert kWh to gCO₂eq using grid carbon intensity.
 
-    Parameters
-    ----------
-    kwh:
-        Energy in kWh.
-    region:
-        Alibaba region key (looked up in GRID_INTENSITY_DEFAULTS).
-    intensity_g_per_kwh:
-        Override the default intensity (gCO₂eq/kWh).
+    Returns grams of CO₂-equivalent.
     """
-    if intensity_g_per_kwh is None:
-        intensity_g_per_kwh = GRID_INTENSITY_DEFAULTS.get(region, 550.0)
-    return kwh * intensity_g_per_kwh
-
-
-@dataclass
-class WasteReport:
-    """Summary of wasted GPU energy and carbon for one scenario."""
-    scenario: str
-    tdp_watts: float
-    wasted_gpu_hours: float
-    wasted_kwh: float
-    wasted_kwh_with_overhead: float
-    wasted_co2eq_kg: float          # kg CO₂eq (÷1000 from g)
-    wasted_co2eq_tonnes: float
-
-    def __str__(self) -> str:
-        return (
-            f"[{self.scenario}] "
-            f"{self.wasted_gpu_hours:,.0f} GPU-hours  "
-            f"{self.wasted_kwh_with_overhead:,.1f} kWh  "
-            f"{self.wasted_co2eq_tonnes:,.2f} tCO₂eq"
-        )
+    intensity = intensity_g_per_kwh or GRID_INTENSITY_DEFAULTS.get(region, 580.0)
+    return kwh * intensity
 
 
 def waste_report(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    eff_src: Path = _EFF_SRC,
     region: str = "cn-beijing",
 ) -> list[WasteReport]:
-    """Generate WasteReport for all TDP scenarios."""
+    """Generate WasteReport for all three TDP scenarios."""
     c = con or _con()
-    gpu_hours = total_wasted_gpu_hours(c, frag_src)
+    gpu_hours = total_unallocated_gpu_hours(c, eff_src)
     reports = []
     for name, tdp in TDP_SCENARIOS.items():
-        kwh_raw  = wasted_kwh(gpu_hours, tdp_watts=tdp, include_overhead=False)
-        kwh_over = wasted_kwh(gpu_hours, tdp_watts=tdp, include_overhead=True)
-        co2_g    = wasted_co2eq(kwh_over, region=region)
+        kwh = wasted_kwh(gpu_hours, tdp)
+        co2 = wasted_co2eq(kwh, region)
         reports.append(WasteReport(
-            scenario=name,
+            tdp_scenario=name,
             tdp_watts=tdp,
-            wasted_gpu_hours=gpu_hours,
-            wasted_kwh=kwh_raw,
-            wasted_kwh_with_overhead=kwh_over,
-            wasted_co2eq_kg=co2_g / 1000.0,
-            wasted_co2eq_tonnes=co2_g / 1_000_000.0,
+            unallocated_gpu_hours=gpu_hours,
+            wasted_kwh=kwh,
+            wasted_co2eq_g=co2,
+            region=region,
         ))
     return reports
 
@@ -170,94 +156,67 @@ def waste_report(
 
 def breakdown_by_priority(
     con: duckdb.DuckDBPyConnection | None = None,
-    pod_src: Path = _POD_SRC,
+    jts_src: Path = _JTS_SRC,
     tdp_watts: float = MIXED_TDP_W,
 ) -> pd.DataFrame:
-    """Wasted GPU-hours and kWh split by pod priority class."""
+    """GPU-hours requested and estimated wasted energy by priority class."""
     c = con or _con()
     df = c.execute(f"""
         SELECT
-            first(priority)                                    AS priority,
-            sum(gpu_requested * (1.0 - coalesce(gpu_util, 0))) AS wasted_gpu_hours,
-            count(DISTINCT pod_uid)                            AS n_pods
-        FROM read_parquet('{pod_src}')
-        WHERE state = 'RUNNING' AND gpu_requested > 0
-        GROUP BY pod_uid
-    """).df()   # pod-level first, then aggregate
-
-    # DuckDB doesn't directly support two-level aggregation in one query here
-    result = c.execute(f"""
-        WITH pod_waste AS (
-            SELECT
-                pod_uid,
-                first(priority)                                    AS priority,
-                sum(gpu_requested * (1.0 - coalesce(gpu_util, 0))) AS wasted_gpu_hours
-            FROM read_parquet('{pod_src}')
-            WHERE state = 'RUNNING' AND gpu_requested > 0
-            GROUP BY pod_uid
-        )
-        SELECT
-            priority,
-            sum(wasted_gpu_hours)             AS wasted_gpu_hours,
-            count(pod_uid)                    AS n_pods,
-            round(sum(wasted_gpu_hours) * {tdp_watts / 1000.0} * {POWER_OVERHEAD}, 1)
-                                              AS wasted_kwh
-        FROM pod_waste
-        GROUP BY priority
-        ORDER BY wasted_gpu_hours DESC
+            priority_class,
+            sum(job_count)                  AS total_jobs,
+            sum(total_gpu_hours_requested)  AS total_gpu_hours_requested
+        FROM read_parquet('{_s(jts_src)}')
+        GROUP BY priority_class
+        ORDER BY total_gpu_hours_requested DESC
     """).df()
-    return result
+    df["wasted_kwh_est"] = df["total_gpu_hours_requested"] * tdp_watts * POWER_OVERHEAD / 1000.0
+    return df
 
 
 def breakdown_by_workload(
     con: duckdb.DuckDBPyConnection | None = None,
-    pod_src: Path = _POD_SRC,
+    jts_src: Path = _JTS_SRC,
     tdp_watts: float = MIXED_TDP_W,
 ) -> pd.DataFrame:
-    """Wasted GPU-hours and kWh split by workload type."""
+    """GPU-hours requested and estimated wasted energy by workload type."""
     c = con or _con()
-    return c.execute(f"""
-        WITH pod_waste AS (
-            SELECT
-                pod_uid,
-                coalesce(first(workload_type), 'unknown')          AS workload_type,
-                sum(gpu_requested * (1.0 - coalesce(gpu_util, 0))) AS wasted_gpu_hours
-            FROM read_parquet('{pod_src}')
-            WHERE state = 'RUNNING' AND gpu_requested > 0
-            GROUP BY pod_uid
-        )
+    df = c.execute(f"""
         SELECT
-            workload_type,
-            sum(wasted_gpu_hours)             AS wasted_gpu_hours,
-            count(pod_uid)                    AS n_pods,
-            round(sum(wasted_gpu_hours) * {tdp_watts / 1000.0} * {POWER_OVERHEAD}, 1)
-                                              AS wasted_kwh,
-            round(sum(wasted_gpu_hours) * 100.0
-                  / sum(sum(wasted_gpu_hours)) OVER (), 2) AS pct_of_total
-        FROM pod_waste
-        GROUP BY workload_type
-        ORDER BY wasted_gpu_hours DESC
+            job_type_public,
+            sum(job_count)                  AS total_jobs,
+            sum(total_gpu_hours_requested)  AS total_gpu_hours_requested,
+            round(avg(mean_gpu_request), 4) AS mean_gpu_request
+        FROM read_parquet('{_s(jts_src)}')
+        GROUP BY job_type_public
+        ORDER BY total_gpu_hours_requested DESC
     """).df()
+    df["wasted_kwh_est"] = df["total_gpu_hours_requested"] * tdp_watts * POWER_OVERHEAD / 1000.0
+    return df
 
 
-# ── Runner ────────────────────────────────────────────────────────────────────
+# ── Convenience runner ────────────────────────────────────────────────────────
 
-def run(trace: str = "v2026") -> None:
-    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="GPU waste energy calculation.")
+    parser.add_argument("--trace", choices=["v2026", "v2023"], default="v2026")
+    parser.parse_args(argv)
+
     con = _con()
-
-    print("[wasted_hours] computing waste reports …")
+    print("=== Waste Report (allocation-based lower bound) ===")
     for r in waste_report(con):
-        print(f"  {r}")
+        print(r)
 
-    print("[wasted_hours] breakdown by priority …")
-    breakdown_by_priority(con).to_csv(TABLE_DIR / "waste_by_priority.csv", index=False)
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    print("\n=== Breakdown by Workload ===")
+    bw = breakdown_by_workload(con)
+    print(bw.to_string(index=False))
+    bw.to_csv(TABLE_DIR / "waste_by_workload.csv", index=False)
 
-    print("[wasted_hours] breakdown by workload …")
-    breakdown_by_workload(con).to_csv(TABLE_DIR / "waste_by_workload.csv", index=False)
-
-    print(f"[wasted_hours] done — tables in {TABLE_DIR}")
+    print("\n=== Breakdown by Priority ===")
+    print(breakdown_by_priority(con).to_string(index=False))
 
 
 if __name__ == "__main__":
-    run()
+    main()

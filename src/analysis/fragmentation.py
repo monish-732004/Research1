@@ -1,17 +1,22 @@
 """RQ1 — GPU resource fragmentation analysis.
 
-All heavy aggregation runs in DuckDB against Parquet files; every public
-function returns a small pandas DataFrame safe to hold in RAM.
+Computes allocation-based fragmentation (capacity never assigned to any job)
+from the three processed tables produced by Phase 2:
 
-Functions
----------
-compute_frag_rate          per (rel_hour, server_tier) frag_rate
-aggregate_by_priority      priority class × frag stats
-aggregate_by_workload_bucket  workload type × frag stats
-aggregate_by_hour_of_day   24-row diurnal profile
-aggregate_by_day           185-row longitudinal profile
-aggregate_by_server_tier   tier × frag stats
-per_pod_frag_rate          per-pod mean frag rate (for CDF figure)
+  server_allocation_efficiency.parquet  — per-server capacity vs requested
+  job_type_summary.parquet              — per (type × priority × spec) group
+  hourly_fleet_capacity.parquet         — per-hour fleet totals
+
+NOTE: Utilization-based fragmentation (GPU allocated but underutilised)
+requires pod_hourly data (Phase 3b when the 351 GB archive arrives).
+The numbers here are a lower bound on true waste.
+
+Metric definitions
+------------------
+  frag_rate  =  1 - (total_requested_gpu_hours / total_capacity_gpu_hours)
+               per server; fleet-level is aggregate of all servers.
+
+All functions return small pandas DataFrames safe to hold in RAM.
 
 Usage
 -----
@@ -22,17 +27,15 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
 
 import duckdb
 import pandas as pd
 
 from src.config import (
-    INTERIM_DIR, PROCESSED_DIR, TABLE_DIR,
+    PROCESSED_DIR, TABLE_DIR,
     DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS,
 )
 
-# ── Connection helper ─────────────────────────────────────────────────────────
 
 def _con() -> duckdb.DuckDBPyConnection:
     c = duckdb.connect()
@@ -41,277 +44,268 @@ def _con() -> duckdb.DuckDBPyConnection:
     return c
 
 
-_FRAG_SRC   = PROCESSED_DIR / "hourly_frag.parquet"
-_POD_SRC    = INTERIM_DIR   / "pod_hourly_canonical.parquet"
-
-# Percentile helper (DuckDB quantile_cont)
-_PCTILE_EXPRS = """
-    round(avg(frag_rate), 4)                  AS mean_frag_rate,
-    round(quantile_cont(frag_rate, 0.50), 4)  AS p50_frag_rate,
-    round(quantile_cont(frag_rate, 0.95), 4)  AS p95_frag_rate,
-    round(quantile_cont(frag_rate, 0.99), 4)  AS p99_frag_rate,
-    round(min(frag_rate), 4)                  AS min_frag_rate,
-    round(max(frag_rate), 4)                  AS max_frag_rate,
-    count(*)                                  AS n_hours
-"""
+def _s(p: Path) -> str:
+    return str(p).replace("\\", "/")
 
 
-# ── Core computation ──────────────────────────────────────────────────────────
+_EFF_SRC = PROCESSED_DIR / "server_allocation_efficiency.parquet"
+_JTS_SRC = PROCESSED_DIR / "job_type_summary.parquet"
+_FLC_SRC = PROCESSED_DIR / "hourly_fleet_capacity.parquet"
+
+
+# ── Core: per-server allocation gap ──────────────────────────────────────────
 
 def compute_frag_rate(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    eff_src: Path = _EFF_SRC,
 ) -> pd.DataFrame:
-    """Add frag_rate column to hourly_frag data.
+    """Per-server allocation-gap fragmentation rate.
 
-    Returns DataFrame: rel_hour, server_tier, total_gpus_requested,
-    total_gpus_used, total_frag_gpu_hours, pod_count, frag_rate.
-    """
-    c = con or _con()
-    return c.execute(f"""
-        SELECT *,
-               CASE WHEN total_gpus_requested > 0
-                    THEN total_frag_gpu_hours / total_gpus_requested
-                    ELSE NULL
-               END AS frag_rate
-        FROM read_parquet('{frag_src}')
-        ORDER BY rel_hour, server_tier
-    """).df()
-
-
-# ── Pod-level frag (for CDF, priority, workload aggregations) ─────────────────
-
-def per_pod_frag_rate(
-    con: duckdb.DuckDBPyConnection | None = None,
-    pod_src: Path = _POD_SRC,
-) -> pd.DataFrame:
-    """Mean fragmentation rate per pod over all its RUNNING hours.
-
-    Returns: pod_uid, gpu_requested_mean, mean_frag_rate, n_running_hours,
-             priority, workload_type.
+    Returns: server_id, server_tier, gpu_spec_public,
+             total_capacity_gpu_hours, total_requested_gpu_hours,
+             frag_gpu_hours, frag_rate.
     """
     c = con or _con()
     return c.execute(f"""
         SELECT
-            pod_uid,
-            avg(gpu_requested)                       AS gpu_requested_mean,
-            avg(CASE WHEN gpu_util IS NOT NULL
-                     THEN 1.0 - gpu_util ELSE NULL END) AS mean_frag_rate,
-            count(*)                                 AS n_running_hours,
-            first(priority)                          AS priority,
-            first(workload_type)                     AS workload_type
-        FROM read_parquet('{pod_src}')
-        WHERE state = 'RUNNING'
-          AND gpu_requested > 0
-        GROUP BY pod_uid
-        ORDER BY pod_uid
+            server_id,
+            server_tier,
+            gpu_spec_public,
+            total_capacity_gpu_hours,
+            total_requested_gpu_hours,
+            job_count,
+            total_capacity_gpu_hours - total_requested_gpu_hours  AS frag_gpu_hours,
+            CASE WHEN total_capacity_gpu_hours > 0
+                 THEN 1.0 - (total_requested_gpu_hours / total_capacity_gpu_hours)
+                 ELSE NULL
+            END                                                   AS frag_rate
+        FROM read_parquet('{_s(eff_src)}')
+        WHERE total_capacity_gpu_hours > 0
+        ORDER BY frag_rate DESC
     """).df()
 
 
 # ── Aggregations ──────────────────────────────────────────────────────────────
 
+_FRAG_PCTILE = """
+    round(avg(frag_rate),                        4) AS mean_frag_rate,
+    round(quantile_cont(frag_rate, 0.50),        4) AS p50_frag_rate,
+    round(quantile_cont(frag_rate, 0.95),        4) AS p95_frag_rate,
+    round(quantile_cont(frag_rate, 0.99),        4) AS p99_frag_rate,
+    round(min(frag_rate),                        4) AS min_frag_rate,
+    round(max(frag_rate),                        4) AS max_frag_rate,
+    count(*)                                        AS n_servers
+"""
+
+
+def aggregate_by_server_tier(
+    con: duckdb.DuckDBPyConnection | None = None,
+    eff_src: Path = _EFF_SRC,
+) -> pd.DataFrame:
+    """Frag stats grouped by server tier (small / medium / large)."""
+    c = con or _con()
+    return c.execute(f"""
+        WITH base AS (
+            SELECT server_tier,
+                   CASE WHEN total_capacity_gpu_hours > 0
+                        THEN 1.0 - total_requested_gpu_hours / total_capacity_gpu_hours
+                        ELSE NULL END AS frag_rate
+            FROM read_parquet('{_s(eff_src)}')
+            WHERE total_capacity_gpu_hours > 0
+        )
+        SELECT server_tier, {_FRAG_PCTILE}
+        FROM base
+        WHERE frag_rate IS NOT NULL
+        GROUP BY server_tier
+        ORDER BY server_tier
+    """).df()
+
+
+def aggregate_by_gpu_spec(
+    con: duckdb.DuckDBPyConnection | None = None,
+    eff_src: Path = _EFF_SRC,
+) -> pd.DataFrame:
+    """Frag stats grouped by GPU spec (A100, H100, L20, …)."""
+    c = con or _con()
+    return c.execute(f"""
+        WITH base AS (
+            SELECT gpu_spec_public,
+                   CASE WHEN total_capacity_gpu_hours > 0
+                        THEN 1.0 - total_requested_gpu_hours / total_capacity_gpu_hours
+                        ELSE NULL END AS frag_rate
+            FROM read_parquet('{_s(eff_src)}')
+            WHERE total_capacity_gpu_hours > 0
+        )
+        SELECT gpu_spec_public, {_FRAG_PCTILE}
+        FROM base
+        WHERE frag_rate IS NOT NULL
+        GROUP BY gpu_spec_public
+        ORDER BY mean_frag_rate DESC
+    """).df()
+
+
 def aggregate_by_priority(
     con: duckdb.DuckDBPyConnection | None = None,
-    pod_src: Path = _POD_SRC,
+    jts_src: Path = _JTS_SRC,
 ) -> pd.DataFrame:
-    """Frag stats grouped by priority class.
+    """Job GPU-hours and job counts grouped by priority class (HP / LP / …).
 
-    Returns: priority, mean/p50/p95/p99 frag_rate, n_pods.
+    NOTE: This is job-allocation distribution, not per-server frag_rate,
+    because job_summary does not carry server-level utilization.
     """
     c = con or _con()
     return c.execute(f"""
-        WITH pod_frag AS (
-            SELECT
-                pod_uid,
-                first(priority)                              AS priority,
-                avg(CASE WHEN gpu_util IS NOT NULL
-                         THEN 1.0 - gpu_util ELSE NULL END) AS frag_rate
-            FROM read_parquet('{pod_src}')
-            WHERE state = 'RUNNING' AND gpu_requested > 0
-            GROUP BY pod_uid
-        )
         SELECT
-            priority,
-            {_PCTILE_EXPRS.replace('n_hours', 'n_pods')},
-            sum(n_pods) OVER () AS total_pods
-        FROM (
-            SELECT priority, {_PCTILE_EXPRS.replace('count(*)', 'count(pod_uid)')}
-            FROM pod_frag
-            GROUP BY priority
-        )
-        ORDER BY priority NULLS LAST
+            priority_class,
+            sum(job_count)                  AS total_jobs,
+            sum(total_gpu_hours_requested)  AS total_gpu_hours,
+            round(avg(mean_gpu_request), 4) AS mean_gpu_request,
+            round(avg(mean_duration_hours), 2) AS mean_duration_hours,
+            round(sum(total_gpu_hours_requested) * 100.0
+                  / sum(sum(total_gpu_hours_requested)) OVER (), 2) AS pct_gpu_hours
+        FROM read_parquet('{_s(jts_src)}')
+        GROUP BY priority_class
+        ORDER BY total_gpu_hours DESC
     """).df()
 
 
 def aggregate_by_workload_bucket(
     con: duckdb.DuckDBPyConnection | None = None,
-    pod_src: Path = _POD_SRC,
+    jts_src: Path = _JTS_SRC,
 ) -> pd.DataFrame:
-    """Frag stats grouped by workload type.
-
-    If workload_type is absent (all NULL), returns a single 'unknown' bucket.
-    Returns: workload_type, mean/p50/p95/p99 frag_rate, n_pods, pct_pods.
-    """
+    """Job GPU-hours grouped by job type (online_inference, offline_inference, …)."""
     c = con or _con()
     return c.execute(f"""
-        WITH pod_frag AS (
-            SELECT
-                pod_uid,
-                coalesce(first(workload_type), 'unknown') AS workload_type,
-                avg(CASE WHEN gpu_util IS NOT NULL
-                         THEN 1.0 - gpu_util ELSE NULL END) AS frag_rate
-            FROM read_parquet('{pod_src}')
-            WHERE state = 'RUNNING' AND gpu_requested > 0
-            GROUP BY pod_uid
-        ),
-        agg AS (
-            SELECT
-                workload_type,
-                round(avg(frag_rate), 4)                  AS mean_frag_rate,
-                round(quantile_cont(frag_rate, 0.50), 4)  AS p50_frag_rate,
-                round(quantile_cont(frag_rate, 0.95), 4)  AS p95_frag_rate,
-                round(quantile_cont(frag_rate, 0.99), 4)  AS p99_frag_rate,
-                round(min(frag_rate), 4)                  AS min_frag_rate,
-                round(max(frag_rate), 4)                  AS max_frag_rate,
-                count(pod_uid)                            AS n_pods
-            FROM pod_frag
-            GROUP BY workload_type
-        )
-        SELECT *,
-               round(n_pods * 100.0 / sum(n_pods) OVER (), 2) AS pct_pods
-        FROM agg
-        ORDER BY n_pods DESC
+        SELECT
+            job_type_public,
+            sum(job_count)                     AS total_jobs,
+            sum(total_gpu_hours_requested)     AS total_gpu_hours,
+            round(avg(mean_gpu_request), 4)    AS mean_gpu_request,
+            round(avg(p50_gpu_request), 4)     AS p50_gpu_request,
+            round(avg(p95_gpu_request), 4)     AS p95_gpu_request,
+            round(avg(mean_duration_hours), 2) AS mean_duration_hours,
+            round(sum(total_gpu_hours_requested) * 100.0
+                  / sum(sum(total_gpu_hours_requested)) OVER (), 2) AS pct_gpu_hours
+        FROM read_parquet('{_s(jts_src)}')
+        GROUP BY job_type_public
+        ORDER BY total_gpu_hours DESC
     """).df()
 
 
 def aggregate_by_hour_of_day(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    flc_src: Path = _FLC_SRC,
 ) -> pd.DataFrame:
-    """24-row diurnal profile: hour_of_day → mean/p50/p95 frag_rate."""
+    """24-row diurnal profile of fleet GPU availability.
+
+    Returns: hour_int, mean/p50/p95 total_gpus_available, mean active_servers.
+    """
     c = con or _con()
     return c.execute(f"""
-        WITH hourly AS (
-            SELECT
-                rel_hour % 24 AS hour_of_day,
-                CASE WHEN total_gpus_requested > 0
-                     THEN total_frag_gpu_hours / total_gpus_requested
-                     ELSE NULL END AS frag_rate
-            FROM read_parquet('{frag_src}')
-        )
         SELECT
-            hour_of_day,
-            {_PCTILE_EXPRS}
-        FROM hourly
-        GROUP BY hour_of_day
-        ORDER BY hour_of_day
+            hour_int,
+            round(avg(total_gpus_available), 0)                    AS mean_gpus,
+            round(quantile_cont(total_gpus_available, 0.50), 0)    AS p50_gpus,
+            round(quantile_cont(total_gpus_available, 0.95), 0)    AS p95_gpus,
+            round(avg(active_servers), 0)                          AS mean_servers
+        FROM read_parquet('{_s(flc_src)}')
+        GROUP BY hour_int
+        ORDER BY hour_int
     """).df()
 
 
 def aggregate_by_day(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    flc_src: Path = _FLC_SRC,
 ) -> pd.DataFrame:
-    """185-row longitudinal profile: day → mean/p50/p95 frag_rate.
-
-    Useful for detecting drift, campaign events, and weekend dips.
-    """
+    """185-row longitudinal profile of fleet GPU availability."""
     c = con or _con()
     return c.execute(f"""
-        WITH daily AS (
-            SELECT
-                rel_hour / 24 AS day,
-                CASE WHEN total_gpus_requested > 0
-                     THEN total_frag_gpu_hours / total_gpus_requested
-                     ELSE NULL END AS frag_rate
-            FROM read_parquet('{frag_src}')
-        )
         SELECT
             day,
-            {_PCTILE_EXPRS}
-        FROM daily
+            round(avg(total_gpus_available), 0) AS mean_gpus,
+            max(total_gpus_available)            AS max_gpus,
+            min(total_gpus_available)            AS min_gpus,
+            round(avg(active_servers), 0)        AS mean_servers
+        FROM read_parquet('{_s(flc_src)}')
         GROUP BY day
         ORDER BY day
     """).df()
 
 
-def aggregate_by_server_tier(
-    con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
-) -> pd.DataFrame:
-    """Per-tier frag stats over the full trace."""
-    c = con or _con()
-    return c.execute(f"""
-        WITH hourly AS (
-            SELECT
-                server_tier,
-                CASE WHEN total_gpus_requested > 0
-                     THEN total_frag_gpu_hours / total_gpus_requested
-                     ELSE NULL END AS frag_rate,
-                total_frag_gpu_hours,
-                total_gpus_requested
-            FROM read_parquet('{frag_src}')
-        )
-        SELECT
-            server_tier,
-            {_PCTILE_EXPRS},
-            sum(total_frag_gpu_hours)  AS total_frag_gpu_hours,
-            sum(total_gpus_requested)  AS total_gpus_requested,
-            round(sum(total_frag_gpu_hours) * 100.0
-                  / nullif(sum(total_gpus_requested), 0), 2) AS overall_frag_pct
-        FROM hourly
-        GROUP BY server_tier
-        ORDER BY overall_frag_pct DESC NULLS LAST
-    """).df()
-
-
 def day_hour_heatmap(
     con: duckdb.DuckDBPyConnection | None = None,
-    frag_src: Path = _FRAG_SRC,
+    flc_src: Path = _FLC_SRC,
 ) -> pd.DataFrame:
-    """185 × 24 heatmap table: day, hour_of_day → mean_frag_rate.
+    """185 × 24 pivot of total_gpus_available.
 
-    Pivoted into a wide DataFrame (index=day, columns=hour_of_day) by
-    the caller (e.g., seaborn heatmap expects this shape).
+    Index = day (0–184), columns = hour_int (0–23).
+    Values = total GPUs available at that (day, hour) cell.
     """
     c = con or _con()
-    long = c.execute(f"""
-        SELECT
-            rel_hour / 24      AS day,
-            rel_hour % 24      AS hour_of_day,
-            avg(CASE WHEN total_gpus_requested > 0
-                     THEN total_frag_gpu_hours / total_gpus_requested
-                     ELSE NULL END) AS mean_frag_rate
-        FROM read_parquet('{frag_src}')
-        GROUP BY 1, 2
-        ORDER BY 1, 2
+    df = c.execute(f"""
+        SELECT day, hour_int, total_gpus_available
+        FROM read_parquet('{_s(flc_src)}')
+        ORDER BY day, hour_int
     """).df()
-    return long.pivot(index="day", columns="hour_of_day", values="mean_frag_rate")
+    return df.pivot(index="day", columns="hour_int", values="total_gpus_available")
 
 
-# ── Runner (save key tables for paper) ───────────────────────────────────────
+# ── Fleet-level headline ──────────────────────────────────────────────────────
 
-def run(trace: str = "v2026") -> None:
+def fleet_headline(
+    con: duckdb.DuckDBPyConnection | None = None,
+    eff_src: Path = _EFF_SRC,
+) -> dict[str, float]:
+    """Single-row fleet totals: capacity, requested, unallocated GPU-hours."""
+    c = con or _con()
+    row = c.execute(f"""
+        SELECT
+            sum(total_capacity_gpu_hours)   AS total_capacity,
+            sum(total_requested_gpu_hours)  AS total_requested,
+            sum(total_capacity_gpu_hours - total_requested_gpu_hours) AS unallocated,
+            count(DISTINCT server_id)       AS n_servers
+        FROM read_parquet('{_s(eff_src)}')
+        WHERE total_capacity_gpu_hours > 0
+    """).fetchone()
+    cap  = float(row[0] or 0)
+    req  = float(row[1] or 0)
+    unalloc = float(row[2] or 0)
+    return {
+        "total_capacity_gpu_hours": cap,
+        "total_requested_gpu_hours": req,
+        "unallocated_gpu_hours": unalloc,
+        "frag_rate": unalloc / cap if cap else 0.0,
+        "n_servers": int(row[3] or 0),
+    }
+
+
+# ── Convenience runner ────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="RQ1 fragmentation analysis.")
+    parser.add_argument("--trace", choices=["v2026", "v2023"], default="v2026")
+    parser.parse_args(argv)  # validate args; trace unused until v2023 support added
+
     TABLE_DIR.mkdir(parents=True, exist_ok=True)
     con = _con()
 
-    print("[fragmentation] computing frag rate …")
-    frag = compute_frag_rate(con)
-    frag.to_csv(TABLE_DIR / "frag_rate_hourly.csv", index=False)
+    headline = fleet_headline(con)
+    print("\n=== Fleet Headline ===")
+    for k, v in headline.items():
+        print(f"  {k:<35} {v:,.2f}" if isinstance(v, float) else f"  {k:<35} {v:,}")
 
-    for name, fn in [
-        ("by_workload",    lambda: aggregate_by_workload_bucket(con)),
-        ("by_priority",    lambda: aggregate_by_priority(con)),
-        ("by_hour_of_day", lambda: aggregate_by_hour_of_day(con)),
-        ("by_day",         lambda: aggregate_by_day(con)),
-        ("by_tier",        lambda: aggregate_by_server_tier(con)),
-    ]:
-        print(f"  {name} …")
-        df = fn()
-        df.to_csv(TABLE_DIR / f"frag_{name}.csv", index=False)
+    print("\n=== By Server Tier ===")
+    print(aggregate_by_server_tier(con).to_string(index=False))
 
-    print(f"[fragmentation] done — tables in {TABLE_DIR}")
+    print("\n=== By Workload Bucket ===")
+    wb = aggregate_by_workload_bucket(con)
+    print(wb.to_string(index=False))
+    wb.to_csv(TABLE_DIR / "table1_frag_by_workload.csv", index=False)
+
+    print("\n=== By Priority Class ===")
+    print(aggregate_by_priority(con).to_string(index=False))
 
 
 if __name__ == "__main__":
-    run()
+    main()
