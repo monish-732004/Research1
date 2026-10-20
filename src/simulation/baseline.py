@@ -68,8 +68,8 @@ def _load_jobs() -> pd.DataFrame:
         lambda s: get_tdp(s) if isinstance(s, str) else DEFAULT_TDP_W
     ).astype(np.float32)
     df["tdp_kw"]  = df["tdp_w"] / 1000.0
-    df["dur_h"]   = np.ceil(df["duration_hours"]).astype(np.int32).clip(1)
-    df["start_h"] = (df["schedule_delay_sec"] / 3600.0).clip(lower=0)
+    df["dur_h"]   = np.ceil(df["duration_hours"].fillna(1.0)).astype(np.int32).clip(1)
+    df["start_h"] = (df["schedule_delay_sec"].fillna(0.0) / 3600.0).clip(lower=0)
     df["start_h"] = np.floor(df["start_h"]).astype(np.int32)
     # clamp so job fits inside trace window
     df["start_h"] = np.minimum(df["start_h"], TRACE_END_HOUR - df["dur_h"] + 1).clip(lower=0)
