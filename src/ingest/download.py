@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -27,6 +28,8 @@ from src.config import RAW_DIR
 
 MANIFEST_DIR = RAW_DIR / "manifests"
 CHUNK_SIZE = 8 * 1024 * 1024   # 8 MiB
+MAX_RETRIES = 20                # max reconnects per archive
+RETRY_BACKOFF = (5, 15, 30, 60, 120)  # seconds between retries (last value repeated)
 
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
@@ -100,39 +103,81 @@ def _md5_file(path: Path) -> str:
 # ── Download ──────────────────────────────────────────────────────────────────
 
 def _download_file(url: str, dest: Path, expected_size: int | None) -> None:
-    """Resumable streaming download of *url* → *dest*."""
+    """Resumable streaming download with automatic reconnect on dropped connections.
+
+    On every connection error the file offset is re-read from disk, a new
+    Range request is issued, and the tqdm bar resumes from where it left off.
+    Up to MAX_RETRIES reconnects are attempted before giving up.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    existing = dest.stat().st_size if dest.exists() else 0
 
-    headers: dict[str, str] = {}
-    if existing:
-        headers["Range"] = f"bytes={existing}-"
+    attempt = 0
+    pbar: tqdm | None = None
 
-    with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
-        if resp.status_code == 416:
-            print(f"  {dest.name}: already fully downloaded (416 Range Not Satisfiable).")
-            return
-        resp.raise_for_status()
+    try:
+        while attempt <= MAX_RETRIES:
+            existing = dest.stat().st_size if dest.exists() else 0
 
-        content_len = int(resp.headers.get("Content-Length", 0))
-        total = content_len + existing if content_len else (expected_size or None)
-        mode = "ab" if existing and resp.status_code == 206 else "wb"
+            headers: dict[str, str] = {}
+            if existing:
+                headers["Range"] = f"bytes={existing}-"
 
-        with (
-            dest.open(mode) as fh,
-            tqdm(
-                total=total,
-                initial=existing,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc=dest.name,
-                leave=True,
-            ) as pbar,
-        ):
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                fh.write(chunk)
-                pbar.update(len(chunk))
+            try:
+                with requests.get(url, headers=headers, stream=True, timeout=120) as resp:
+                    if resp.status_code == 416:
+                        print(f"  {dest.name}: already fully downloaded.")
+                        return
+                    resp.raise_for_status()
+
+                    content_len = int(resp.headers.get("Content-Length", 0))
+                    total = content_len + existing if content_len else (expected_size or None)
+                    mode = "ab" if existing and resp.status_code == 206 else "wb"
+
+                    if pbar is None:
+                        pbar = tqdm(
+                            total=total,
+                            initial=existing,
+                            unit="B",
+                            unit_scale=True,
+                            unit_divisor=1024,
+                            desc=dest.name,
+                            leave=True,
+                        )
+                    else:
+                        # Update total/initial in case Content-Length changed on resume
+                        pbar.total = total
+                        pbar.n = existing
+                        pbar.last_print_n = existing
+                        pbar.refresh()
+
+                    with dest.open(mode) as fh:
+                        for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                            fh.write(chunk)
+                            pbar.update(len(chunk))
+
+                    return  # success
+
+            except (
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                attempt += 1
+                if attempt > MAX_RETRIES:
+                    raise
+                delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+                restarted = dest.stat().st_size if dest.exists() else 0
+                if pbar is not None:
+                    pbar.write(
+                        f"  Connection dropped ({exc.__class__.__name__}) after "
+                        f"{restarted/1e9:.2f} GB — retry {attempt}/{MAX_RETRIES} "
+                        f"in {delay}s …"
+                    )
+                time.sleep(delay)
+
+    finally:
+        if pbar is not None:
+            pbar.close()
 
 
 # ── Extract ───────────────────────────────────────────────────────────────────
