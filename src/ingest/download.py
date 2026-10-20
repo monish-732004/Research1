@@ -5,10 +5,15 @@ Usage
     python -m src.ingest.download --trace v2026
     python -m src.ingest.download --trace v2026 --out data/raw/v2026/
     python -m src.ingest.download --trace v2026 --dry-run
+    python -m src.ingest.download --trace v2026 --only asi_opensource_pod_hourly --stream-extract
 
 The manifest YAML (data/raw/manifests/{trace}.yaml) lists each archive.
 When ``md5`` is null the downloader computes the hash after a successful
 download, prints it, and writes it back into the YAML for future runs.
+
+--stream-extract: download and extract simultaneously without saving the ZIP.
+  Resumes automatically by skipping already-extracted files.
+  Saves ~350 GB of disk space for large archives.
 """
 
 from __future__ import annotations
@@ -28,8 +33,133 @@ from src.config import RAW_DIR
 
 MANIFEST_DIR = RAW_DIR / "manifests"
 CHUNK_SIZE = 8 * 1024 * 1024   # 8 MiB
+_STREAM_CHUNK = 10 * 1024 * 1024  # 10 MiB download chunks for stream-extract
 MAX_RETRIES = 20                # max reconnects per archive
 RETRY_BACKOFF = (5, 15, 30, 60, 120)  # seconds between retries (last value repeated)
+
+
+# ── Streaming ZIP extractor ───────────────────────────────────────────────────
+
+def _stream_extract_zip(
+    url: str,
+    dest_dir: Path,
+    expected_size: int | None,
+    skip_existing: bool = True,
+) -> None:
+    """Download *url* and extract to *dest_dir* in one streaming pass.
+
+    Uses stream-unzip to parse the ZIP on-the-fly — never writes the full
+    archive to disk (saves ~350 GB for large archives).
+    Already-extracted files (size > 0) are skipped; their bytes are consumed
+    and discarded so the stream stays in sync.
+    Partial output files are deleted on KeyboardInterrupt or extraction error.
+    Re-running resumes automatically by skipping existing files.
+
+    Auto-retries up to MAX_RETRIES times on connection drops.
+    """
+    from stream_unzip import stream_unzip
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    extracted = skipped = errors = 0
+
+    attempt = 0
+    while attempt <= MAX_RETRIES:
+        try:
+            pbar = tqdm(
+                total=expected_size, unit='B', unit_scale=True,
+                unit_divisor=1024, desc='stream-extract', leave=True,
+                initial=0,
+            )
+
+            def _chunks():
+                with requests.get(url, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_content(chunk_size=_STREAM_CHUNK):
+                        if chunk:
+                            pbar.update(len(chunk))
+                            yield chunk
+
+            current_out: Path | None = None
+            try:
+                for file_name_raw, _file_size, unzipped_chunks in stream_unzip(_chunks()):
+                    fname    = (file_name_raw.decode('utf-8', errors='replace')
+                                if isinstance(file_name_raw, bytes) else file_name_raw)
+                    out_path = dest_dir / fname
+
+                    if fname.endswith('/'):
+                        out_path.mkdir(parents=True, exist_ok=True)
+                        for _ in unzipped_chunks:   # must consume
+                            pass
+                        continue
+
+                    # ── Skip already-extracted files ──────────────────────────
+                    if skip_existing and out_path.exists() and out_path.stat().st_size > 0:
+                        for _ in unzipped_chunks:   # must consume to keep stream in sync
+                            pass
+                        skipped += 1
+                        pbar.set_postfix(ext=extracted, skip=skipped, err=errors)
+                        continue
+
+                    # ── Extract ───────────────────────────────────────────────
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    current_out = out_path
+                    try:
+                        with out_path.open('wb') as fh:
+                            for chunk in unzipped_chunks:
+                                fh.write(chunk)
+                        extracted += 1
+                        current_out = None
+                    except Exception as exc:
+                        for _ in unzipped_chunks:   # drain remaining chunks
+                            pass
+                        errors += 1
+                        if current_out and current_out.exists():
+                            current_out.unlink(missing_ok=True)
+                        current_out = None
+                        pbar.write(f'  [warn] {fname}: {exc}')
+
+                    pbar.set_postfix(ext=extracted, skip=skipped, err=errors)
+
+            except (
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                attempt += 1
+                if attempt > MAX_RETRIES:
+                    pbar.close()
+                    raise
+                delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+                pbar.write(
+                    f'  Connection dropped ({exc.__class__.__name__}) — '
+                    f'retry {attempt}/{MAX_RETRIES} in {delay}s …'
+                )
+                if current_out and current_out.exists():
+                    current_out.unlink(missing_ok=True)
+                pbar.close()
+                time.sleep(delay)
+                continue  # restart
+
+            except KeyboardInterrupt:
+                if current_out and current_out.exists():
+                    current_out.unlink(missing_ok=True)
+                pbar.close()
+                raise
+
+            pbar.close()
+            break  # success
+
+        except (
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ):
+            pass  # handled above
+
+    print(
+        f'  Stream extract complete: '
+        f'{extracted} extracted, {skipped} skipped, {errors} errors'
+    )
 
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
@@ -220,6 +350,7 @@ def run(
     out_dir: Path,
     dry_run: bool = False,
     only: str | None = None,
+    stream_extract: bool = False,
 ) -> None:
     yaml_path, manifest = _load_manifest(trace)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -254,6 +385,15 @@ def run(
             extracted = "EXTRACTED" if unpacks_to.exists() else "NOT-YET"
             print(f"  [{status}|{extracted}] {name}  ({size/1e9:.1f} GB)" if size else f"  [{status}|{extracted}] {name}")
             continue
+
+        # ── Stream-extract mode: download + extract simultaneously ───────────
+        if stream_extract:
+            print(
+                f"  {name}: stream-extract ({(size or 0)/1e9:.2f} GB) "
+                f"→ {unpacks_to} …"
+            )
+            _stream_extract_zip(url, unpacks_to, size)
+            continue  # skip ZIP save / MD5 / regular extract
 
         # ── 1. Download ZIP ───────────────────────────────────────────────────
         if zip_dest.exists():
@@ -313,9 +453,18 @@ def main(argv: list[str] | None = None) -> None:
         metavar="NAME",
         help="Download only the archive whose name matches (with or without .zip).",
     )
+    parser.add_argument(
+        "--stream-extract",
+        action="store_true",
+        help=(
+            "Download and extract simultaneously without saving the ZIP. "
+            "Saves ~350 GB of disk space. Skips already-extracted files on resume."
+        ),
+    )
     args = parser.parse_args(argv)
     out_dir = args.out or (RAW_DIR / args.trace)
-    run(args.trace, out_dir, dry_run=args.dry_run, only=args.only)
+    run(args.trace, out_dir, dry_run=args.dry_run, only=args.only,
+        stream_extract=args.stream_extract)
 
 
 if __name__ == "__main__":
