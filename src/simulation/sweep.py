@@ -82,8 +82,15 @@ def run_sweep(workers: int = 4, force: bool = False) -> pd.DataFrame:
           f"with {workers} workers …")
 
     t0 = time.perf_counter()
-    with mp.Pool(processes=workers) as pool:
-        cads_results = pool.map(_cads_worker, configs)
+    if workers == 1:
+        cads_results = []
+        for i, cfg in enumerate(configs):
+            cads_results.append(_cads_worker(cfg))
+            if (i + 1) % 10 == 0:
+                print(f"  [sweep] {i+1}/{len(configs)} done")
+    else:
+        with mp.Pool(processes=workers) as pool:
+            cads_results = pool.map(_cads_worker, configs)
     elapsed = time.perf_counter() - t0
     print(f"  [sweep] CADS done in {elapsed:.0f}s  "
           f"({len(cads_results)} results)")
