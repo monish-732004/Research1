@@ -38,21 +38,21 @@ in the trace metadata and (ii) its original mean carbon intensity exceeds a
 configurable threshold $\theta$.  Non-deferrable jobs (online inference,
 high-priority) are never shifted.
 
-\subsection{CAPSR: A Domain-Specific Predictor}
+\subsection{CAPSR: A Domain-Specific Fragmentation Predictor}
 \label{sec:capsr}
 
-Standard regression algorithms treat all GPU jobs as draws from a single
-distribution.  We propose CAPSR (Carbon-Aware Priority-Stratified Regressor),
-a novel domain-specific algorithm built from first principles using only
-NumPy and SciPy.  CAPSR introduces three contributions:
+Standard regression models treat all GPU workloads uniformly, ignoring the
+fundamentally different resource consumption patterns across priority classes
+and job types.  We propose CAPSR (Carbon-Aware Priority-Stratified Regressor),
+a scheduling-domain algorithm with three novel components:
 
-\subsubsection{Stratified Sub-Models}
-
-CAPSR partitions the training set into strata defined by the Cartesian product
-of \texttt{job\_type\_public} and \texttt{priority\_class}.  For each stratum
-$\mathcal{S}_k$ with at least $N_{\min}$ samples, CAPSR fits an independent
-weighted Ridge regression:
-
+\paragraph{Priority-stratified sub-models.}
+CAPSR partitions the training set by (\texttt{priority\_class}
+$\times$ \texttt{job\_type\_public}) and trains a separate regularised
+least-squares model per stratum.  Strata with fewer than 100 samples fall back
+to a global model.  This captures the distinct \texttt{gpu\_hours} distributions
+of, e.g., HP online-inference pods versus LP training jobs, which a single model
+would average away.  For each qualifying stratum $k$, the closed-form solution is:
 \begin{equation}
   \hat{\boldsymbol{\beta}}_k
     = \bigl(\mathbf{X}_k^\top \mathbf{W}_k \mathbf{X}_k
@@ -60,49 +60,34 @@ weighted Ridge regression:
       \mathbf{X}_k^\top \mathbf{W}_k \mathbf{y}_k
   \label{eq:ridge}
 \end{equation}
+solved via \texttt{numpy.linalg.solve} for numerical stability.
 
-Strata below $N_{\min}$ fall back to the global model.  Because training jobs
-and inference jobs differ dramatically in their GPU-hours distributions, this
-per-stratum approach outperforms a global model on stratum-level accuracy even
-when the overall RMSE is comparable to Random Forest.
+\paragraph{Carbon-weighted loss.}
+Each training sample is weighted by $1 + c_i / \bar{c}$, where $c_i$ is the
+synthetic carbon intensity at the job's estimated execution hour and $\bar{c}$
+is the fleet-wide mean.  Jobs executed during high-carbon periods thus contribute
+proportionally more to the regression loss, biasing predictions toward accuracy
+on the highest-impact workloads.
 
-\subsubsection{Carbon-Weighted Loss}
-
-When carbon intensity data are available, CAPSR assigns sample weight
-\begin{equation}
-  w_i = 1 + \frac{c_i}{\bar{c}}, \quad \bar{c} = \frac{1}{N}\sum_i c_i
-  \label{eq:weight}
-\end{equation}
-so that jobs running during high-carbon windows contribute more to the
-regression fit, aligning model optimisation with the deferral objective.
-
-\subsubsection{Deferral Confidence Score}
-
-CAPSR exposes a \texttt{predict\_deferral\_confidence} method that returns,
-for each job, a per-stratum z-score passed through a sigmoid:
+\paragraph{Deferral confidence scoring.}
+At inference time, CAPSR additionally outputs a deferral confidence score
+$\sigma(z)$ where $z = (\hat{y} - \mu_s)/\sigma_s$ is the standardised
+prediction relative to stratum $s$'s training distribution and $\sigma$ is the
+sigmoid function:
 \begin{equation}
   \text{conf}_i = \sigma\!\left(\frac{\hat{y}_i - \mu_k}{\sigma_k}\right),
   \quad \sigma(z) = \frac{1}{1+e^{-z}}
   \label{eq:conf}
 \end{equation}
-where $\mu_k$ and $\sigma_k$ are the training mean and standard deviation of
-stratum $k$.  A confidence near 1 indicates that the job is predicted to
-consume above-average GPU-hours \emph{for its type and priority class},
-making it a strong carbon-deferral candidate.
+Scores above 0.6 flag a job as a high-waste candidate; the CADS scheduler uses
+this signal in predictive mode (Section~\ref{sec:cads}) to preferentially defer
+jobs predicted to waste the most GPU capacity.
 
-This score replaces the static CI threshold of baseline CADS:
-jobs with $\text{conf}_i > 0.6$ are prioritised for deferral in
-predictive CADS mode (\S\ref{sec:cads}), providing a more principled
-ranking than comparing every job to a global threshold.
-
-\subsubsection{Evaluation: Deferral Precision@K}
-
-We introduce Deferral Precision@K as CAPSR's unique evaluation metric:
-\begin{equation}
-  \text{DP}@K = \frac{|\{i \in \text{top-}K : y_i > \bar{y}\}|}{K}
-\end{equation}
-where the top-$K$ set is the $K\%$ of test jobs with the highest
-\texttt{conf} score.  A random ranker achieves DP@10\% $\approx 0.50$;
-CAPSR's stratified confidence should improve this toward 1.0 to the extent
-that above-mean GPU-hours jobs are predictable from job metadata alone.
+\paragraph{Evaluation: Deferral Precision@10.}
+We introduce Deferral Precision@10 as CAPSR's unique evaluation metric: the
+fraction of the top 10\% of test jobs ranked by deferral confidence that are
+genuinely above their stratum's mean \texttt{gpu\_hours}.  A random ranker
+achieves $\approx$0.50; CAPSR's stratified confidence should improve this
+substantially to the extent that above-mean GPU-hours jobs are predictable
+from job metadata alone.
 
