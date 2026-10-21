@@ -1,0 +1,11 @@
+{
+  "region": "cn-east",
+  "anchor": "2025-07-01",
+  "total_co2_kg": 75315495.10137849,
+  "total_jobs": 40522307,
+  "total_gpu_hours": 254980593.89405555,
+  "deferrable_jobs": 14246582,
+  "deferrable_gpu_hours": 29980149.248,
+  "uncertain_starts": 22187596,
+  "uncertain_pct": 54.75
+}

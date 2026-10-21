@@ -140,6 +140,32 @@ def _stream_extract_zip(
                 time.sleep(delay)
                 continue  # restart
 
+            except Exception as exc:
+                # Catch stream_unzip.TruncatedDataError and similar mid-stream
+                # failures that indicate a dropped connection, not a bad ZIP.
+                exc_name = type(exc).__name__
+                if exc_name in ('TruncatedDataError', 'UnexpectedSignatureError',
+                                'MissingExtraError'):
+                    attempt += 1
+                    if attempt > MAX_RETRIES:
+                        pbar.close()
+                        raise
+                    delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+                    pbar.write(
+                        f'  Stream truncated ({exc_name}) — '
+                        f'retry {attempt}/{MAX_RETRIES} in {delay}s …'
+                    )
+                    if current_out and current_out.exists():
+                        current_out.unlink(missing_ok=True)
+                    pbar.close()
+                    time.sleep(delay)
+                    continue  # restart the whole stream
+                # Not a retriable error — re-raise
+                if current_out and current_out.exists():
+                    current_out.unlink(missing_ok=True)
+                pbar.close()
+                raise
+
             except KeyboardInterrupt:
                 if current_out and current_out.exists():
                     current_out.unlink(missing_ok=True)

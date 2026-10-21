@@ -49,27 +49,28 @@ def make_splits(force: bool = False) -> pd.DataFrame:
     if not _FEAT.exists():
         raise RuntimeError("Run src.modeling.features first.")
 
-    print("  [split] Reading feature table pod_ids …")
-    df = pd.read_parquet(_FEAT, columns=["pod_id"])
-
-    # job_type_public for stratification — read from raw interim
-    from src.config import INTERIM_DIR
+    print("  [split] Reading feature table pod_ids and job types …")
+    # job_type_public is stored in the interim canonical, but to avoid re-reading
+    # 40M rows we re-read it from the already-filtered features parquet via DuckDB.
     import duckdb
-    from src.config import DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS
+    from src.config import DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS, INTERIM_DIR
 
     c = duckdb.connect()
     c.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}'")
     c.execute(f"SET threads={DUCKDB_THREADS}")
 
-    interim = str(INTERIM_DIR / "job_summary_canonical.parquet").replace("\\", "/")
-    jt = c.execute(f"""
-        SELECT pod_id, job_type_public
-        FROM read_parquet('{interim}')
-        WHERE left_truncated = FALSE AND right_truncated = FALSE
-    """).df()
+    feat_path = str(_FEAT).replace("\\", "/")
+    interim   = str(INTERIM_DIR / "job_summary_canonical.parquet").replace("\\", "/")
 
-    merged = df.merge(jt, on="pod_id", how="left")
-    merged["job_type_public"] = merged["job_type_public"].fillna("unknown")
+    # Join on pod_id to get job_type for only the filtered feature rows.
+    # Use ANY_VALUE to collapse duplicate pod_ids in the canonical to one row.
+    merged = c.execute(f"""
+        SELECT f.pod_id,
+               COALESCE(ANY_VALUE(j.job_type_public), 'unknown') AS job_type_public
+        FROM read_parquet('{feat_path}') f
+        LEFT JOIN read_parquet('{interim}') j USING (pod_id)
+        GROUP BY f.pod_id
+    """).df()
 
     # Stratified split: train vs (val+test), then split remainder into val/test
     train_idx, rest_idx = train_test_split(

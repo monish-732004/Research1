@@ -83,27 +83,30 @@ def build_features(
 
     sample_clause = "USING SAMPLE 10%" if fast else ""
     df = c.execute(f"""
-        SELECT
-            pod_id,
-            server_id,
-            gpu_spec_public,
-            model_type_public,
-            priority_class,
-            job_type_public,
-            gpu_request,
-            duration_hours,
-            schedule_delay_sec,
-            ready_delay_sec,
-            is_genai_request,
-            is_deferrable,
-            ready_status,
-            schedule_status,
-            gpu_hours_requested AS y
-        FROM read_parquet('{_s(_SRC)}') {sample_clause}
-        WHERE left_truncated  = FALSE
-          AND right_truncated = FALSE
-          AND gpu_hours_requested IS NOT NULL
-          AND duration_hours > 0
+        SELECT *
+        FROM (
+            SELECT
+                pod_id,
+                server_id,
+                gpu_spec_public,
+                model_type_public,
+                priority_class,
+                job_type_public,
+                gpu_request,
+                duration_hours,
+                schedule_delay_sec,
+                ready_delay_sec,
+                is_genai_request,
+                is_deferrable,
+                ready_status,
+                schedule_status,
+                gpu_hours_requested AS y
+            FROM read_parquet('{_s(_SRC)}')
+            WHERE left_truncated  = FALSE
+              AND right_truncated = FALSE
+              AND gpu_hours_requested IS NOT NULL
+              AND duration_hours > 0
+        ) {sample_clause}
     """).df()
 
     print(f"  [features] {len(df):,} rows after filter.  Building features …")

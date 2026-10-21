@@ -1,0 +1,104 @@
+% ── Section 3: Dataset ────────────────────────────────────────────────────────
+\section{Dataset and Preprocessing}
+\label{sec:dataset}
+
+% ── 3.1 Dataset ───────────────────────────────────────────────────────────────
+\subsection{Dataset}
+\label{sec:dataset:source}
+
+We use \texttt{cluster-trace-gpu-v2026}, a production GPU cluster trace
+released by Alibaba alongside the OSDI~2026 paper~\cite{alibaba2026trace}.
+The trace captures Alibaba Serverless Infrastructure (ASI), a hyperscale
+scheduling platform that co-locates training, inference, and batch workloads.
+Four fact tables are provided: \texttt{server\_hourly} (per-server GPU
+inventory at hourly resolution), \texttt{job\_execution\_summary} (one row
+per pod lifecycle with scheduling and priority metadata),
+\texttt{network\_hourly} (per-server bandwidth for a 7-day window), and
+\texttt{pod\_hourly} (fine-grained per-pod utilisation, distributed
+separately as a 351\,GB archive).
+The trace spans 185~days and peaks at 155{,}410~GPUs across 37{,}707~servers,
+making it the largest publicly available GPU cluster trace to date.
+Alibaba anonymises the data in two ways consequential to our methodology:
+absolute calendar dates are suppressed in favour of a monotonic \texttt{day}
+counter, and server region labels are omitted; we address both through
+sensitivity analyses in Section~\ref{sec:dataset:limitations}.
+
+% ── 3.2 Preprocessing ─────────────────────────────────────────────────────────
+\subsection{Preprocessing}
+\label{sec:dataset:preprocessing}
+
+\paragraph{Temporal indexing.}
+The \texttt{hour} column in \texttt{server\_hourly} is stored as a
+zero-padded \texttt{VARCHAR} (e.g., \texttt{"07"}).
+We cast it to \texttt{INTEGER} and derive a monotonic relative-hour index
+$\mathit{rel\_hour} = \mathit{day} \times 24 + \mathit{hour\_int}$,
+spanning $[0,\,4439]$ across the 185-day trace window.
+
+\paragraph{Server tier classification.}
+We partition physical servers into three capacity tiers by \texttt{gpu\_count}:
+\emph{small} ($\leq 2$~GPUs, typically single-card inference hosts),
+\emph{medium} ($3$--$8$~GPUs, standard training nodes),
+and \emph{large} ($>8$~GPUs, high-memory multi-node pods).
+This taxonomy captures the distinct scheduling regimes observed across
+workload types in the trace.
+
+\paragraph{Deferral eligibility.}
+A pod is marked \texttt{is\_deferrable} when three conditions hold jointly:
+its \texttt{job\_type\_public} is not \texttt{online\_inference} (no
+user-facing latency requirement), its \texttt{priority\_class} is LP
+(low priority), and its \texttt{ready\_status} is \texttt{TRUE} (the pod
+was fully resourced but not yet dispatched).
+These are the pods CADS (Section~\ref{sec:cads}) is permitted to shift.
+
+\paragraph{Truncation handling.}
+Pods first observed in state \textsc{running} at $\mathit{rel\_hour}=0$
+are flagged left-truncated (true start time unknown); pods still
+\textsc{running} at $\mathit{rel\_hour}=4439$ are flagged right-truncated.
+Both sets are excluded from duration and fragmentation-gap calculations
+but retained for aggregate GPU-hour accounting.
+
+\paragraph{Thermal design power assignment.}
+We assign TDP from public Nvidia and AMD spec sheets for all known GPU
+models (A100~=~400\,W, H100~=~700\,W, H20~=~500\,W, L20~=~275\,W, etc.).
+Alibaba's proprietary XPU accelerators (XPU-A through XPU-E) carry no
+published TDP; we assign conservative estimates of 250--350\,W based on
+comparable datacenter accelerator classes and report a $\pm30\%$
+sensitivity sweep across all XPU rows in
+Section~\ref{sec:carbon_analysis}.
+
+% ── 3.3 Limitations ───────────────────────────────────────────────────────────
+\subsection{Limitations}
+\label{sec:dataset:limitations}
+
+\paragraph{Suppressed calendar dates.}
+Absolute dates are replaced by a relative counter, preventing direct
+alignment with historical grid carbon intensity signals.
+We run all carbon analyses under three calendar anchors
+(1~Jan, 1~Apr, and 1~Jul~2025) and report the resulting range of
+\mbox{CO\textsubscript{2}}-equivalent estimates throughout.
+
+\paragraph{Absent region labels.}
+Server locations are not disclosed, precluding assignment to specific
+electricity grids.
+We instead model carbon intensity under four synthetic Chinese grid
+profiles (North, East, South, Northwest) parameterised by published
+annual averages and diurnal load curves, spanning the plausible range
+from coal-heavy to hydro-mixed generation mixes
+(Section~\ref{sec:carbon_analysis}).
+
+\paragraph{Unavailable pod-hourly utilisation.}
+The \texttt{pod\_hourly} table was unavailable during our analysis;
+intra-hour resource utilisation is therefore unobservable.
+Our fragmentation estimates derive from \texttt{server\_hourly}
+allocation records, so the reported allocation gap is a
+\emph{lower bound} on true idle GPU time.
+We expect Phase~3b analysis on \texttt{pod\_hourly} to reveal
+additional utilisation-level waste not captured here.
+
+\paragraph{XPU thermal uncertainty.}
+The unknown TDP of Alibaba's XPU family is the largest single
+uncertainty in our energy estimates.
+The $\pm30\%$ sensitivity sweep in Section~\ref{sec:carbon_analysis}
+bounds the resulting figures and demonstrates that qualitative
+findings are stable across the full range of plausible XPU power
+envelopes.

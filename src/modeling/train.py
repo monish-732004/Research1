@@ -49,7 +49,7 @@ def train_all(fast: bool = False) -> tuple[list, dict[str, float]]:
     fitted     = []
     train_times: dict[str, float] = {}
 
-    for algo in all_algorithms():
+    for algo in all_algorithms(fast=fast):
         print(f"\n  [train] Fitting {algo.name} …")
         t0 = time.perf_counter()
         algo.fit(X_train, y_train, X_val, y_val)
