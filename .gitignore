@@ -13,6 +13,10 @@ data/processed/
 outputs/figures/
 outputs/tables/
 outputs/logs/
+outputs/sim_runs/*.json
+outputs/*.json
+outputs/*.html
+outputs/*.csv
 
 # Python
 __pycache__/
